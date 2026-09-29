@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Text;
 
@@ -421,8 +422,8 @@ namespace TvStationAssistant
             Console.WriteLine();
         }
 
-        static void checkSplits(string in_path, string out_path, double threshhold, double black_level)
-        { //done
+        static void checkSplits(string in_path, string out_path, double threshhold, double black_level, bool fine_tune)
+        {
             if (!Directory.Exists(in_path))
             {
                 Console.WriteLine("Input directory does not exist: " + in_path);
@@ -438,8 +439,8 @@ namespace TvStationAssistant
             List<string> files = GetFiles(in_path, file_extensions);
 
             string vcodec = use_nvidia
-                ? $"-c:v h264_nvenc -preset {nvenc_preset} -profile:v high -level 3.1 -rc vbr -cq 22 -b:v 0 -maxrate 4M -bufsize 4M -g 60 -bf 0"
-                : "-c:v libx264 -preset fast -profile:v high -level 3.1 -crf 23 -maxrate 4M -bufsize 4M -g 60 -bf 2";
+                ? $"-c:v h264_nvenc -preset slow -profile:v high -level 3.1 -rc vbr -cq 28 -b:v 0 -maxrate 1200k -bufsize 1200k -g 60 -bf 0"
+                : "-c:v libx264 -preset fast -profile:v high -level 3.1 -crf 26 -maxrate 1200k -bufsize 1200k -g 60 -bf 2";
 
             string vf = "yadif=0:-1:1,scale=640:480,setsar=1,setdar=4/3,fps=29.97";
 
@@ -453,6 +454,7 @@ namespace TvStationAssistant
 
                 Stopwatch fileTimer = Stopwatch.StartNew();
 
+                /*
                 List<TimeSpan> breaks = scanForCommercialBreaks(
                     file,
                     threshhold,
@@ -462,13 +464,41 @@ namespace TvStationAssistant
                     black_level: black_level,
                     addStartEnd: true
                 );
+                */
+
+                Console.WriteLine("");
+                Console.WriteLine("Scanning for Black Frames...");
+
+                List<TimeSpan> blackBreaks = scanForCommercialBreaks(
+                    file,
+                    threshhold,
+                    wait: 0,
+                    min_time_add: 12,
+                    min_end_time: 5,
+                    black_level: black_level,
+                    addStartEnd: true
+                );
+                List<TimeSpan> breaks = null;
+                if (fine_tune)
+                {
+                    Console.WriteLine("");
+                    Console.WriteLine("Scanning for Scene Cuts...");
+
+                    List<TimeSpan> sceneCuts = scanForSceneCuts(file, sceneThresh: 0.20);
+                    // Unified list of cuts snapped to frame boundaries
+                    breaks = alignBreaksWithScenes(blackBreaks, sceneCuts, windowSeconds: 0.45);
+                }
+                else
+                {
+                    breaks = blackBreaks;
+                }
 
                 if (breaks.Count < 2)
                 {
                     Console.WriteLine("No ad transitions detected in: " + Path.GetFileName(file));
                     continue;
                 }
-
+                
                 int totalCuts = breaks.Count - 1;
                 Console.WriteLine($"Found {totalCuts} cuts.");
 
@@ -477,20 +507,19 @@ namespace TvStationAssistant
 
                 for (int i = 1; i <= totalCuts; i++)
                 {
-                    TimeSpan start = breaks[i - 1];
-                    TimeSpan rawLength = breaks[i] - start;
+                    TimeSpan boundaryBuffer = TimeSpan.FromMilliseconds(134);
+                    TimeSpan start = breaks[i - 1] + boundaryBuffer;
+                    TimeSpan length = breaks[i] - start - boundaryBuffer;
 
-                    TimeSpan length = rawLength > TimeSpan.FromMilliseconds(500)
-                        ? rawLength - TimeSpan.FromMilliseconds(333)
-                        : rawLength;
-
-                    if (length.TotalSeconds < 3.0)
+                    if (length.TotalSeconds < 0.0)
                     {
                         continue;
                     }
 
-                    string startStr = $"{start.Hours:D2}:{start.Minutes:D2}:{start.Seconds:D2}.{start.Milliseconds:D3}";
-                    string lengthStr = $"{length.Hours:D2}:{length.Minutes:D2}:{length.Seconds:D2}.{length.Milliseconds:D3}";
+                    // Generate two-stage precision seek parameters
+                    string[] seek = BuildPrecisionSeekArgs(start.TotalSeconds, length.TotalSeconds);
+                    string preSeek = seek[0];
+                    string postSeek = seek[1];
 
                     string baseName = Path.GetFileNameWithoutExtension(file);
                     string outputName = $"{baseName}_{i:D3}_{rnd.Next(1, 999):D3}.mp4";
@@ -509,11 +538,12 @@ namespace TvStationAssistant
                     TimeSpan fileElapsed = fileTimer.Elapsed;
                     Console.Write($"\rExtracting cut {i}/{totalCuts} ({Math.Round(length.TotalSeconds)}s) | Elapsed: {fileElapsed.Minutes:D2}:{fileElapsed.Seconds:D2} | ETA: {etaString}   ");
 
-                    AddLog($"Exporting video #{i}: Start {startStr}, Duration {lengthStr} -> {outputName}");
+                    AddLog($"Exporting video #{i}: Start {start.TotalSeconds:F3}s, Duration {length.TotalSeconds:F3}s -> {outputName}");
 
-                    string args = $"-y -ss {startStr} -i \"{file}\" -t {lengthStr} {vcodec} " +
+                    // Note: {postSeek} already includes the '-t {duration}' flag from BuildPrecisionSeekArgs
+                    string args = $"-y {preSeek}-i \"{file}\" {postSeek}{vcodec} " +
                                   $"-pix_fmt yuv420p -vsync cfr -vf \"{vf}\" " +
-                                  $"-c:a aac -b:a 128k -ar 48000 -ac 2 " +
+                                  $"-c:a aac -b:a 96k -ar 48000 -ac 2 " +
                                   $"-af \"aresample=async=1:first_pts=0\" " +
                                   $"-movflags +faststart \"{targetPath}\"";
 
@@ -664,6 +694,122 @@ namespace TvStationAssistant
             Console.WriteLine("Finished moving tagged files.\n");
         }
 
+        static List<TimeSpan> alignBreaksWithScenes(List<TimeSpan> blackBreaks, List<TimeSpan> sceneCuts, double windowSeconds = 0.40)
+        {
+            List<TimeSpan> aligned = new List<TimeSpan>();
+
+            for (int i = 0; i < blackBreaks.Count; i++)
+            {
+                TimeSpan bTime = blackBreaks[i];
+
+                // Leave boundary caps (0:00:00 and total duration) alone
+                if (i == 0 && bTime == TimeSpan.Zero)
+                {
+                    aligned.Add(bTime);
+                    continue;
+                }
+                if (i == blackBreaks.Count - 1 && i > 0)
+                {
+                    aligned.Add(bTime);
+                    continue;
+                }
+
+                double bSeconds = bTime.TotalSeconds;
+                double closestDiff = double.MaxValue;
+                TimeSpan bestScene = bTime;
+
+                // Find the nearest hard scene cut within the window
+                for (int s = 0; s < sceneCuts.Count; s++)
+                {
+                    double sSeconds = sceneCuts[s].TotalSeconds;
+                    double diff = Math.Abs(sSeconds - bSeconds);
+
+                    if (diff <= windowSeconds && diff < closestDiff)
+                    {
+                        closestDiff = diff;
+                        bestScene = sceneCuts[s];
+                    }
+                }
+
+                if (closestDiff < double.MaxValue)
+                {
+                    // Snapped to exact cut frame
+                    aligned.Add(bestScene);
+                }
+                else
+                {
+                    // No hard cut found within window; keep original midpoint
+                    aligned.Add(bTime);
+                }
+            }
+
+            return aligned;
+        }
+
+
+        static List<TimeSpan> scanForSceneCuts(string file, double sceneThresh = 0.40)
+        {
+            string sThresh = sceneThresh.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+            ProcessStartInfo psi = new ProcessStartInfo
+            {
+                FileName = ffmpeg_location,
+                Arguments = $"-i \"{file}\" -vf \"select='gt(scene,{sThresh})',metadata=print\" -an -f null -",
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            AddLog("scanForSceneCuts:" + psi.Arguments);
+
+            List<TimeSpan> scenes = new List<TimeSpan>();
+
+            using (Process proc = Process.Start(psi))
+            {
+                if (proc == null)
+                {
+                    AddLog("Error starting FFmpeg scene scan process");
+                    return scenes;
+                }
+
+                AddLog("Scanning for Scene Cuts...");
+                DateTime now = DateTime.Now;
+                string line;
+
+                while ((line = proc.StandardError.ReadLine()) != null)
+                {
+                    if ((DateTime.Now - now) > TimeSpan.FromSeconds(0.25))
+                    {
+                        Console.Write(".");
+                        now = DateTime.Now;
+                    }
+
+                    // Look for pts_time in: "frame:X pts:Y pts_time:12.345"
+                    if (line.Contains("pts_time:"))
+                    {
+                        int idx = line.IndexOf("pts_time:");
+                        string sTime = line.Substring(idx + 9).Trim();
+
+                        if (double.TryParse(sTime, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double ptsTime))
+                        {
+                            scenes.Add(TimeSpan.FromSeconds(ptsTime));
+                            Console.Write("+" + scenes[scenes.Count - 1].ToString());
+                        }
+                    }
+                }
+
+                try
+                {
+                    if (!proc.HasExited) proc.Kill();
+                }
+                catch { }
+            }
+
+            Console.WriteLine();
+            AddLog("Finished scene scan..... found " + scenes.Count + " cuts");
+            return scenes;
+        }
+
         static List<TimeSpan> scanForCommercialBreaks(string file, double threshhold, double wait, int min_time_add = 300, int min_end_time = 59, double black_level = 0.05, bool addStartEnd = true)
         { //done
             TimeSpan vid_dur = getVideoDuration(file);
@@ -806,6 +952,32 @@ namespace TvStationAssistant
             {
                 // Don't let a logging lockup crash the video pipeline
             }
+        }
+
+        static string[] BuildPrecisionSeekArgs(double startTimeSeconds, double durationSeconds, double preSeekBufferSeconds = 5.0)
+        {
+            double start = Math.Max(0.0, startTimeSeconds);
+            double duration = Math.Max(0.000001, durationSeconds);
+
+            string durationStr = duration.ToString("0.######", CultureInfo.InvariantCulture);
+
+            if (start <= preSeekBufferSeconds)
+            {
+                string directSeekStr = start.ToString("0.######", CultureInfo.InvariantCulture);
+                return new string[] { "", $"-ss {directSeekStr} -t {durationStr} " };
+            }
+
+            double roughSeek = start - preSeekBufferSeconds;
+            double fineSeek = preSeekBufferSeconds;
+
+            string roughStr = roughSeek.ToString("0.######", CultureInfo.InvariantCulture);
+            string fineStr = fineSeek.ToString("0.######", CultureInfo.InvariantCulture);
+
+            return new string[]
+            {
+                $"-ss {roughStr} ",
+                $"-ss {fineStr} -t {durationStr} "
+            };
         }
 
         static void drawScreen(int which_one)
@@ -1327,21 +1499,34 @@ namespace TvStationAssistant
             string splitOut = Console.ReadLine()?.Trim('"', '\'') ?? "";
 
             if (string.IsNullOrEmpty(splitOut))
-            {
+            { //if it's blank, create the default
                 splitOut = Path.Combine(splitIn, "output");
-                if (!Directory.Exists(splitOut))
-                    Directory.CreateDirectory(splitOut);
             }
-            else if (!Directory.Exists(splitOut))
+            else
+            {   
+                splitOut = Path.Combine(splitIn, splitOut);
+            }
+
+
+            if (!Directory.Exists(splitOut))
+            { //if directory doesn't exist, we need to create it
+
+                Directory.CreateDirectory(splitOut);
+                Console.WriteLine("");
+                Console.WriteLine("** " + splitOut + " directory was created. **");
+                Console.WriteLine("");
+            }
+            else
             {
-                drawMessage("Output directory does not exist: " + splitOut);
-                return;
+                drawMessage(splitOut + " exists.\r\nFiles maybe be overwritten.\r\nProceed with caution.");
             }
 
             double sThresh = PromptDouble("Enter threshold (length of black dip in seconds):", 0.5);
             double sBlack = PromptDouble("Enter black level (e.g. 0.05):", 0.05);
 
-            checkSplits(splitIn, splitOut, sThresh, sBlack);
+            bool bFine = PromptBool("Fine Tune?", false);
+
+            checkSplits(splitIn, splitOut, sThresh, sBlack, bFine);
 
             drawMessage("Splits complete!");
             AddLog("Splits complete for: " + splitIn);
@@ -1744,6 +1929,22 @@ namespace TvStationAssistant
                     break;
                     case '3':
                         ProcessSplitVideoMenu();
+                    break;
+                    case '4':
+                        string file = @"D:\Video\80's Commercials Vol. 1180 [h__MbJfmWh4]_NA_.webm";
+                        List<TimeSpan> blackBreaks = scanForCommercialBreaks(file, 0.1, wait: 0.1, min_time_add: 0, min_end_time:0, black_level: 0.1, addStartEnd: true);
+                        List<TimeSpan> sceneCuts = scanForSceneCuts(file, sceneThresh: 0.40);
+
+                        // Unified list of cuts snapped to frame boundaries
+                        List<TimeSpan> breaks = alignBreaksWithScenes(blackBreaks, sceneCuts, windowSeconds: 0.45);
+
+                        foreach(TimeSpan t in breaks)
+                        {
+                            Console.WriteLine(t.ToString());
+                        }    
+
+                        Console.ReadKey();
+
                     break;
                     case '5':
                         ProcessMoveTaggedFilesMenu();
