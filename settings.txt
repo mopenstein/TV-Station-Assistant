@@ -1,4 +1,0 @@
-ffmpeg location=C:\ffmpeg\ffmpeg.exe
-alt ffmpeg location=C:\ffmpegX\bin\ffmpeg.exe
-temp folder=C:\ffmpeg\temp_folder
-log file=C:\ffmpeg\temp_folder
