@@ -1,1323 +1,812 @@
 ﻿using System;
-using System.Windows.Forms;
 using System.Collections.Generic;
-using System.Linq;
 using System.Diagnostics;
 using System.IO;
-using System.Drawing;
 using System.Text;
 
-namespace ConsoleApplication1
+namespace TvStationAssistant
 {
     class Program
     {
 
-        static string[] video_file_extensions = new string[] { ".3g2", ".3gp", ".asf", ".avi", ".flv", ".h264", ".m2t", ".m2ts", ".m4a", ".m4v", ".mkv", ".mod", ".mov", ".mp3", ".ogg", "wav", ".mp4", ".mpg", ".png", ".tod", ".ts", ".vob", ".webm", ".wmv" };
-
-        static List<string> GetFiles(string folder, string[] ext_filter = null, string[] name_filter = null)
-        {
-            if (!Directory.Exists(folder)) return null;
-            if (folder == "") return new List<string>();
-            List<string> str = new List<string>();
-            int i = 0;
-            foreach (string file in Directory.EnumerateFiles(folder, "*.*"))
-            {
-                string fe = Path.GetExtension(file.ToString());
-                bool add = false;
-                //only include extensions that match ext_filter
-
-                if (ext_filter != null)
-                {
-                    foreach (string f in ext_filter)
-                    {
-                        if (fe.ToString().ToLower() == f.ToLower()) add = true;
-                    }
-                }
-                else add = true;
-
-                //filter file names that meet name_filter
-                if (add)
-                {
-                    string fn = Path.GetFileNameWithoutExtension(file.ToString());
-                    if (name_filter != null)
-                    {
-                        foreach (string f in name_filter)
-                        {
-                            if (fn.ToString().IndexOf(f) > -1) add = false;
-                        }
-                    }
-                }
-                if (add) str.Add(file.ToString());
-
-                i++;
-            }
-            return str;
-        }
-
+        static string[] file_extensions = new string[] { ".3g2", ".3gp", ".asf", ".avi", ".flv", ".h264", ".m2t", ".m2ts", ".m4a", ".m4v", ".mkv", ".mod", ".mov", ".mp3", ".ogg", "wav", ".mp4", ".mpg", ".png", ".tod", ".ts", ".vob", ".webm", ".wmv" };
         static string ffmpeg_location = "";
-        static string ffmpegX_location = "";
         static string temp_folder = "";
+        static bool use_nvidia = false;
+        static string nvenc_preset = "fast"; // fallback default
+        private static string Log_File = "";
 
         static bool Normalizing = false;
 
-        static TimeSpan[] NormalizeAudio(string file, bool Verbose = false)
+        static bool DetectNvidiaEncoder()
         {
+            if (string.IsNullOrEmpty(ffmpeg_location) || !File.Exists(ffmpeg_location))
+                return false;
+
+            // 1. Try modern SDK presets (p4)
+            if (TestNvencPreset("p4"))
+            {
+                nvenc_preset = "p4";
+                return true;
+            }
+
+            // 2. Try legacy SDK presets (fast)
+            if (TestNvencPreset("fast"))
+            {
+                nvenc_preset = "fast";
+                return true;
+            }
+
+            // 3. Neither worked or no NVIDIA GPU/driver available
+            return false;
+        }
+
+        static string PromptSetting(string label, string currentValue)
+        { //done
+            Console.WriteLine();
+            Console.WriteLine();
+            if (!string.IsNullOrEmpty(currentValue))
+            {
+                Console.WriteLine($"{label} [Current: {currentValue}]");
+                Console.WriteLine("(Press Enter to keep current, or type a new path)");
+            }
+            else
+            {
+                Console.WriteLine(label);
+            }
+            Console.Write("> ");
+
+            string input = Console.ReadLine()?.Trim();
+            return string.IsNullOrEmpty(input) ? currentValue : input;
+        }        
+
+        static bool TestNvencPreset(string presetName)
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = ffmpeg_location,
+                    Arguments = $"-y -f lavfi -i color=c=black:s=64x64:d=0.04 -c:v h264_nvenc -preset {presetName} -f null -",
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+
+                using (Process proc = Process.Start(psi))
+                {
+                    if (proc == null) return false;
+                    proc.StandardError.ReadToEnd(); // drain buffer
+                    proc.WaitForExit();
+                    return proc.ExitCode == 0;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        static List<string> GetFiles(string folder, string[] ext_filter = null, string[] name_filter = null)
+        { //done
+            List<string> str = new List<string>();
+
+            if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder))
+                return str;
+
+            foreach (string file in Directory.EnumerateFiles(folder, "*.*"))
+            {
+                // 1. Check Extension Filter (whitelist: must match at least one if provided)
+                if (ext_filter != null && ext_filter.Length > 0)
+                {
+                    string fe = Path.GetExtension(file);
+                    bool matchExt = false;
+                    foreach (string ext in ext_filter)
+                    {
+                        if (string.Equals(fe, ext, StringComparison.OrdinalIgnoreCase))
+                        {
+                            matchExt = true;
+                            break;
+                        }
+                    }
+
+                    if (!matchExt) continue;
+                }
+
+                // 2. Check Name Filter (blacklist: skip if contains any forbidden substring)
+                if (name_filter != null && name_filter.Length > 0)
+                {
+                    string fn = Path.GetFileNameWithoutExtension(file);
+                    bool forbidden = false;
+                    foreach (string badStr in name_filter)
+                    {
+                        if (fn.IndexOf(badStr, StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            forbidden = true;
+                            break;
+                        }
+                    }
+
+                    if (forbidden) continue;
+                }
+
+                // Passed all checks
+                str.Add(file);
+            }
+
+            return str;
+        }
+
+        static TimeSpan[] NormalizeAudio(string file, bool Verbose = false)
+        { //done
             Normalizing = true;
             if (Verbose) Console.WriteLine("Normalizing has begun!");
-            TimeSpan[] ret = { TimeSpan.FromSeconds(0), TimeSpan.FromSeconds(0) };
+            TimeSpan[] ret = { TimeSpan.Zero, TimeSpan.Zero };
 
             string pad = "_NA_";
             string path = Path.GetDirectoryName(file);
-            string file_name = Path.GetFileNameWithoutExtension(file);
-            string ext_name = Path.GetExtension(file);
-            if (Verbose) Console.WriteLine("Checking if file exists " + path + "\\" + file_name + pad + "" + ext_name);
-            if (File.Exists(path + "\\" + file_name + pad + "" + ext_name) || file.IndexOf(pad) >= 0)
+            string fileName = Path.GetFileNameWithoutExtension(file);
+            string extName = Path.GetExtension(file);
+            string targetPath = Path.Combine(path, fileName + pad + extName);
+
+            if (Verbose) Console.WriteLine("Checking if file exists " + targetPath);
+            if (File.Exists(targetPath) || file.Contains(pad))
             {
                 if (Verbose) Console.WriteLine("File exists skipping");
-                AddLog("File Exists, skipping normaliztion");
+                AddLog("File Exists, skipping normalization");
+                Normalizing = false;
                 return ret;
             }
 
-            if (Verbose) Console.WriteLine("Starting new process");
-            Process proc = new Process();
-            proc.StartInfo.FileName = ffmpegX_location;
-            if (Verbose) Console.WriteLine("Setting file location");
-            proc.StartInfo.Arguments = "-y -i \"" + file + "\" -af loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json -f null /dev/null";
-            if (Verbose) Console.WriteLine("Assigning Arguments");
-            proc.StartInfo.RedirectStandardError = true;
-            proc.StartInfo.CreateNoWindow = false;
-            proc.StartInfo.UseShellExecute = false;
-
-            if (Verbose) Console.WriteLine("Starting process");
-            if (!proc.Start())
-            {
-                Console.WriteLine("Error starting");
-            }
-            if (Verbose) Console.WriteLine("Process started");
-            StreamReader reader = proc.StandardError;
-            string line;
-            string input_i = "";
-            string input_lra = "";
-            string input_tp = "";
-            string input_thresh = "";
-            string input_offset = "";
-
+            // ==========================================
+            // PASS 1: Loudness Analysis
+            // ==========================================
             Console.WriteLine("Generating Filter...");
-            if(!Verbose) Console.CursorVisible = false;
+            if (!Verbose) Console.CursorVisible = false;
 
-            TimeSpan procTDur = new TimeSpan();
             DateTime start = DateTime.Now;
-            if (Verbose) Console.WriteLine("Begining to read lines");
-            while ((line = reader.ReadLine()) != null)
+            TimeSpan totalDuration = TimeSpan.Zero;
+
+            string input_i = "", input_lra = "", input_tp = "", input_thresh = "", input_offset = "";
+
+            // -vn and -sn drop video/subs decode so analysis runs dramatically faster.
+            // -f null - replaces /dev/null to run properly on modern Windows binaries.
+            ProcessStartInfo psiPass1 = new ProcessStartInfo
             {
-                string dur = "";
-                int a = line.IndexOf("Duration");
-                int x = line.IndexOf("Segment");
-                if (a >= 0 && x == -1)
+                FileName = ffmpeg_location,
+                Arguments = $"-y -i \"{file}\" -vn -sn -af loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json -f null -",
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using (Process proc = Process.Start(psiPass1))
+            {
+                if (proc == null)
                 {
-                    int b = line.IndexOf(",", a + 1);
-                    dur = line.Substring(a + 10, b - a - 10);
-                    string[] durs = dur.Split(':');
-                    procTDur = new TimeSpan(0, int.Parse(durs[0]), int.Parse(durs[1]), int.Parse(durs[2].Split('.')[0]), int.Parse(durs[2].Split('.')[1]));
+                    Console.WriteLine("Error starting FFmpeg");
+                    if (!Verbose) Console.CursorVisible = true;
+                    Normalizing = false;
+                    return ret;
                 }
 
-                int percent = 0;
-
-                try
+                string line;
+                while ((line = proc.StandardError.ReadLine()) != null)
                 {
-                    string find = "time=";
-                    a = line.IndexOf(find);
-                    if (a >= 0)
+                    // Duration parsing
+                    if (line.Contains("Duration") && !line.Contains("Segment"))
                     {
-                        int b = line.IndexOf(" ", a + 1);
-                        dur = line.Substring(a + find.Length, b - a - find.Length);
-                        string[] durs = dur.Split(':');
-                        TimeSpan tdur = new TimeSpan(0, int.Parse(durs[0]), int.Parse(durs[1]), int.Parse(durs[2].Split('.')[0]), int.Parse(durs[2].Split('.')[1]));
-                        percent = (int)((tdur.TotalSeconds / procTDur.TotalSeconds) * 100);
+                        int a = line.IndexOf("Duration");
+                        int b = line.IndexOf(",", a + 1);
+                        if (a >= 0 && b > a)
+                        {
+                            string durStr = line.Substring(a + 10, b - a - 10).Trim();
+                            TimeSpan.TryParse(durStr, out totalDuration);
+                        }
                     }
+
+                    // Progress Bar render
+                    RenderConsoleProgress(line, totalDuration);
+
+                    // Parameter capture
+                    ExtractJsonParam(line, "\"input_i\" : \"", ref input_i, "input_i");
+                    ExtractJsonParam(line, "\"input_lra\" : \"", ref input_lra, "input_lra");
+                    ExtractJsonParam(line, "\"input_tp\" : \"", ref input_tp, "input_tp");
+                    ExtractJsonParam(line, "\"input_thresh\" : \"", ref input_thresh, "input_thresh");
+                    ExtractJsonParam(line, "\"target_offset\" : \"", ref input_offset, "input_offset");
                 }
-                catch
-                { }
-
-                string pbar = "";
-                for (int t = 0; t < 50; t++)
-                {
-                    if (t <= Math.Floor((double)percent / 2))
-                    {
-                        pbar += "█";
-                    }
-                    else
-                    {
-                        pbar += "░";
-                    }
-                }
-
-
-                Console.Write(pbar);
-                Console.WriteLine();
-
-                try
-                {
-                    Console.SetCursorPosition(0, Console.CursorTop - 1);
-                }
-                catch { }
-
-                a = 0;
-                string phrase = "";
-
-                phrase = "\"input_i\" : \"";
-                a = line.IndexOf(phrase);
-                x = line.IndexOf("Segment");
-                if (a >= 0 && x == -1)
-                {
-                    int b = line.IndexOf("\"", a + phrase.Length + 1);
-                    input_i = line.Substring(a + phrase.Length, b - a - phrase.Length);
-                    AddLog("Found input_i: " + line.Substring(a + phrase.Length, b - a - phrase.Length));
-                    //Console.WriteLine("Found input_i: " + line.Substring(a + phrase.Length, b - a - phrase.Length));
-
-                }
-
-                phrase = "\"input_lra\" : \"";
-                a = line.IndexOf(phrase);
-                if (a >= 0)
-                {
-                    int b = line.IndexOf("\"", a + phrase.Length + 1);
-                    input_lra = line.Substring(a + phrase.Length, b - a - phrase.Length);
-                    AddLog("Found input_lra: " + line.Substring(a + phrase.Length, b - a - phrase.Length));
-                    //Console.WriteLine("Found input_lra: " + line.Substring(a + phrase.Length, b - a - phrase.Length));
-                }
-
-                phrase = "\"input_tp\" : \"";
-                a = line.IndexOf(phrase);
-                if (a >= 0)
-                {
-                    int b = line.IndexOf("\"", a + phrase.Length + 1);
-                    input_tp = line.Substring(a + phrase.Length, b - a - phrase.Length);
-                    AddLog("Found input_tp: " + line.Substring(a + phrase.Length, b - a - phrase.Length));
-                    //Console.WriteLine("Found input_tp: " + line.Substring(a + phrase.Length, b - a - phrase.Length));
-                }
-
-                phrase = "\"input_thresh\" : \"";
-                a = line.IndexOf(phrase);
-                if (a >= 0)
-                {
-                    int b = line.IndexOf("\"", a + phrase.Length + 1);
-                    input_thresh = line.Substring(a + phrase.Length, b - a - phrase.Length);
-                    AddLog("Found input_thresh: " + line.Substring(a + phrase.Length, b - a - phrase.Length));
-                    //Console.WriteLine("Found input_thresh: " + line.Substring(a + phrase.Length, b - a - phrase.Length));
-                }
-
-                phrase = "\"target_offset\" : \"";
-                a = line.IndexOf(phrase);
-                if (a >= 0)
-                {
-                    int b = line.IndexOf("\"", a + phrase.Length + 1);
-                    input_offset = line.Substring(a + phrase.Length, b - a - phrase.Length);
-                    AddLog("Found input_offset: " + line.Substring(a + phrase.Length, b - a - phrase.Length));
-                    //Console.WriteLine("Found input_offset: " + line.Substring(a + phrase.Length, b - a - phrase.Length));
-                }
+                proc.WaitForExit();
             }
 
-            //ffmpeg -i in.wav -af loudnorm=I=-16:TP=-1.5:LRA=11:
-            //measured_I =-27.61:
-            //measured_LRA =18.06:
-            //measured_TP=-4.47:
-            //measured_thresh=-39.20:
-            //offset=0.58:linear=true:print_format=summary -ar 48k out.wav
-            //
-            proc.Close();
+            try { Console.SetCursorPosition(0, Console.CursorTop + 2); } catch { }
 
-
-
-            string filter = "loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=" + input_i + ":measured_LRA=" + input_lra + ":measured_TP=" + input_tp + ":measured_thresh=" + input_thresh + ":offset=" + input_offset + ":linear=true:print_format=summary";
-
-            proc.StartInfo.FileName = ffmpegX_location;
-            //
-            proc.StartInfo.Arguments = "-y -i \"" + file + "\" -vcodec copy -af " + filter + (file.ToLower().IndexOf(".mp3") > 0 ? " -map_metadata 0 -id3v2_version 3 -write_id3v1 1 " : "") + " \"" + path + "\\" + file_name + pad + "" + ext_name + "\"";
-            //Console.WriteLine(proc.StartInfo.Arguments.ToString());
-            proc.StartInfo.RedirectStandardError = true;
-            proc.StartInfo.UseShellExecute = false;
-
-            if (!proc.Start())
-            {
-                Console.WriteLine("Error starting");
-            }
-            reader = proc.StandardError;
-
-            try
-            {
-                Console.SetCursorPosition(0, Console.CursorTop + 2);
-            }
-            catch { }
-
-            TimeSpan total = TimeSpan.FromTicks(DateTime.Now.Ticks - start.Ticks);
-
-            ret[0] = total;
-            Console.WriteLine("Finished Generating Filter. Took " + total.ToString());
-
+            TimeSpan pass1Duration = DateTime.Now - start;
+            ret[0] = pass1Duration;
+            Console.WriteLine("Finished Generating Filter. Took " + pass1Duration);
             Console.WriteLine();
 
+            // ==========================================
+            // PASS 2: Applying Audio Filter
+            // ==========================================
             Console.WriteLine("Applying audio filter...");
             start = DateTime.Now;
-            while ((line = reader.ReadLine()) != null)
+
+            string filter = $"loudnorm=I=-16:TP=-1.5:LRA=11:measured_I={input_i}:measured_LRA={input_lra}:measured_TP={input_tp}:measured_thresh={input_thresh}:offset={input_offset}:linear=true:print_format=summary";
+            string mp3Args = file.EndsWith(".mp3", StringComparison.OrdinalIgnoreCase) ? " -map_metadata 0 -id3v2_version 3 -write_id3v1 1 " : " ";
+
+            ProcessStartInfo psiPass2 = new ProcessStartInfo
             {
+                FileName = ffmpeg_location,
+                Arguments = $"-y -i \"{file}\" -vcodec copy -af {filter}{mp3Args}\"{targetPath}\"",
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
 
-                //Console.WriteLine(line);
-                string dur = "";
-                int a = line.IndexOf("Duration");
-                int x = line.IndexOf("Segment");
-                if (a >= 0 && x == -1)
+            using (Process proc = Process.Start(psiPass2))
+            {
+                if (proc == null)
                 {
-                    int b = line.IndexOf(",", a + 1);
-                    dur = line.Substring(a + 10, b - a - 10);
-                    string[] durs = dur.Split(':');
-                    procTDur = new TimeSpan(0, int.Parse(durs[0]), int.Parse(durs[1]), int.Parse(durs[2].Split('.')[0]), int.Parse(durs[2].Split('.')[1]));
-                    Console.WriteLine(procTDur.ToString());
+                    Console.WriteLine("Error starting FFmpeg pass 2");
+                    if (!Verbose) Console.CursorVisible = true;
+                    Normalizing = false;
+                    return ret;
                 }
 
-                int percent = 0;
-
-                try
+                string line;
+                while ((line = proc.StandardError.ReadLine()) != null)
                 {
-                    string find = "time=";
-                    a = line.IndexOf(find);
-                    if (a >= 0)
+                    if (line.Contains("Duration") && !line.Contains("Segment"))
                     {
-                        int b = line.IndexOf(" ", a + 1);
-                        dur = line.Substring(a + find.Length, b - a - find.Length);
-                        string[] durs = dur.Split(':');
-                        TimeSpan tdur = new TimeSpan(0, int.Parse(durs[0]), int.Parse(durs[1]), int.Parse(durs[2].Split('.')[0]), int.Parse(durs[2].Split('.')[1]));
-                        percent = (int)((tdur.TotalSeconds / procTDur.TotalSeconds) * 100);
+                        int a = line.IndexOf("Duration");
+                        int b = line.IndexOf(",", a + 1);
+                        if (a >= 0 && b > a)
+                        {
+                            string durStr = line.Substring(a + 10, b - a - 10).Trim();
+                            TimeSpan.TryParse(durStr, out totalDuration);
+                        }
                     }
+
+                    RenderConsoleProgress(line, totalDuration);
                 }
-                catch
-                { }
-
-                string pbar = "";
-                for (int t = 0; t < 50; t++)
-                {
-                    if (t <= Math.Floor((double)percent / 2))
-                    {
-                        pbar += "█";
-                    }
-                    else
-                    {
-                        pbar += "░";
-                    }
-                }
-
-
-                Console.Write(pbar);
-                Console.WriteLine();
-
-                try
-                {
-                    Console.SetCursorPosition(0, Console.CursorTop - 1);
-                }
-                catch { }
-
+                proc.WaitForExit();
             }
 
-            //Console.ReadKey();
-            try
-            {
-                Console.SetCursorPosition(0, Console.CursorTop + 1);
-            }
-            catch { }
+            try { Console.SetCursorPosition(0, Console.CursorTop + 1); } catch { }
 
-
-            total = TimeSpan.FromTicks(DateTime.Now.Ticks - start.Ticks);
+            TimeSpan pass2Duration = DateTime.Now - start;
+            ret[1] = pass2Duration;
             Console.WriteLine();
-            ret[1] = total;
-            Console.WriteLine("Finished Applying Filter. Took " + total.ToString());
-
+            Console.WriteLine("Finished Applying Filter. Took " + pass2Duration);
             Console.WriteLine();
 
-            if (File.Exists(file + ".commercials"))
+            // Sidecar commercials rename
+            string commSrc = file + ".commercials";
+            string commDst = targetPath + ".commercials";
+            if (File.Exists(commSrc))
             {
-                Console.WriteLine();
-                Console.WriteLine("Renamed commercials file!");
-                File.SetAttributes(file + ".commercials", FileAttributes.Normal);
-                File.Move(file + ".commercials", path + "\\" + file_name + pad + "" + ext_name + ".commercials");
+                Console.WriteLine("\nRenamed commercials file!");
+                File.SetAttributes(commSrc, FileAttributes.Normal);
+                File.Move(commSrc, commDst);
             }
 
-            //make sure the current file and the audio adjusted file exists
-            if (File.Exists(file) && File.Exists(path + "\\" + file_name + pad + "" + ext_name))
+            // Safely delete original only if target exists
+            if (File.Exists(file) && File.Exists(targetPath))
             {
-                Console.WriteLine();
-                Console.WriteLine("Deleted original file!");
+                Console.WriteLine("\nDeleted original file!");
                 File.SetAttributes(file, FileAttributes.Normal);
                 File.Delete(file);
             }
 
-
             Console.WriteLine();
-            proc.Close();
             if (!Verbose) Console.CursorVisible = true;
             Normalizing = false;
             return ret;
+        }
 
+        // Helper to keep the ASCII progress bar logic tidy and re-usable across passes
+        static void RenderConsoleProgress(string line, TimeSpan totalDuration)
+        { //done
+            if (totalDuration.TotalSeconds <= 0 || !line.Contains("time=")) return;
+
+            try
+            {
+                int a = line.IndexOf("time=");
+                int b = line.IndexOf(" ", a + 1);
+                if (a >= 0 && b > a)
+                {
+                    string timeStr = line.Substring(a + 5, b - a - 5).Trim();
+                    if (TimeSpan.TryParse(timeStr, out TimeSpan currentTime))
+                    {
+                        int percent = (int)((currentTime.TotalSeconds / totalDuration.TotalSeconds) * 100);
+                        percent = Math.Max(0, Math.Min(100, percent));
+
+                        int filled = Math.Min(50, (int)Math.Floor(percent / 2.0));
+                        string bar = new string('█', filled).PadRight(50, '░');
+
+                        Console.WriteLine(bar);
+                        try { Console.SetCursorPosition(0, Console.CursorTop - 1); } catch { }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        // Helper to extract JSON string fields from loudnorm's print_format=json output
+        static void ExtractJsonParam(string line, string tag, ref string outputVar, string logName)
+        { //done
+            int a = line.IndexOf(tag);
+            if (a >= 0 && !line.Contains("Segment"))
+            {
+                int b = line.IndexOf("\"", a + tag.Length);
+                if (b > a)
+                {
+                    outputVar = line.Substring(a + tag.Length, b - a - tag.Length);
+                    AddLog($"Found {logName}: {outputVar}");
+                }
+            }
         }
 
         static void AddTimeStringToFileName(string file)
-        {
+        { //done
+            const string padL = "%T(";
+            const string padR = ")%";
 
-
-            string padL = "%T(";
-            string padR = ")%";
-
-            string path = Path.GetDirectoryName(file);
-            string file_name = Path.GetFileNameWithoutExtension(file);
-            string ext_name = Path.GetExtension(file);
-
-
-            if (file.IndexOf(padL) >= 0 && file.IndexOf(padR) >= 0)
+            if (file.Contains(padL) && file.Contains(padR))
             {
                 Console.WriteLine("Time already added, skipping!");
                 return;
             }
 
-            Console.Write("Getting video length: " + file_name + " ... ");
-            file_name = ReturnCleanASCII(file_name); // since we're here, let's remove non-ascii characters. It will save a possible headache later
-            TimeSpan t = getVideoDuration(file);
-            Console.Write(t.ToString());
-            Console.WriteLine("");
-            string pad = padL + Math.Round(t.TotalSeconds).ToString() + padR;
+            string path = Path.GetDirectoryName(file);
+            string fileName = Path.GetFileNameWithoutExtension(file);
+            string extName = Path.GetExtension(file);
 
-            if (File.Exists(path + "\\" + file_name + pad + "" + ext_name))
+            Console.Write($"Getting video length: {fileName} ... ");
+            fileName = ReturnCleanASCII(fileName);
+
+            TimeSpan duration = getVideoDuration(file);
+            Console.WriteLine(duration.ToString());
+
+            string pad = $"{padL}{Math.Round(duration.TotalSeconds)}{padR}";
+            string newFileName = $"{fileName}{pad}{extName}";
+            string targetPath = Path.Combine(path, newFileName);
+
+            if (File.Exists(targetPath))
             {
                 Console.WriteLine("File Exists, skipping!");
                 return;
             }
-            int count = 0;
-            while (true)
-            {
-                    try
-                    {
-                        Console.Write("Renaming file...");
-                        File.SetAttributes(file, FileAttributes.Normal);
-                        File.Move(file, path + "\\" + file_name + pad + "" + ext_name);
-                        if (File.Exists(path + "\\" + file_name + pad + "" + ext_name)) break;
-                    }
-                    catch (Exception e)
-                    {
-                        Console.Write(count.ToString()+"... ");
-                        System.Threading.Thread.Sleep(1000);
-                    }
-                count++;
-                if (count > 15) break;
 
+            int retryCount = 0;
+            while (retryCount <= 15)
+            {
+                try
+                {
+                    Console.Write("Renaming file... ");
+                    File.SetAttributes(file, FileAttributes.Normal);
+                    File.Move(file, targetPath);
+
+                    if (File.Exists(targetPath))
+                        break;
+                }
+                catch
+                {
+                    Console.Write($"{retryCount}... ");
+                    System.Threading.Thread.Sleep(1000);
+                }
+
+                retryCount++;
             }
 
-            if (File.Exists(file + ".commercials"))
+            // Rename matching .commercials sidecar if present
+            string commSrc = file + ".commercials";
+            string commDst = targetPath + ".commercials";
+            if (File.Exists(commSrc))
             {
                 Console.WriteLine();
                 Console.WriteLine("Renamed commercials file!");
-                File.SetAttributes(file + ".commercials", FileAttributes.Normal);
-                File.Move(file + ".commercials", path + "\\" + file_name + pad + "" + ext_name + ".commercials");
-            }
-            Console.WriteLine("Done!");
-            Console.WriteLine("");
-        }
-
-        static void checkCommercials()
-        {
-            Process proc = new Process();
-            proc.StartInfo.FileName = ffmpeg_location;
-            string folder = Path.GetDirectoryName(ffmpeg_location) + "\\convert\\";
-            string output_folder = Path.GetDirectoryName(ffmpeg_location) + "\\output\\";
-
-            //foreach (string file in Directory.EnumerateFiles(folder, "*.*"))
-            //{
-            //File.Move(file.ToString(), folder + Path.GetFileName(file.ToString().Replace(" ", "")));
-            //}
-
-            //get duration
-            string line;
-
-            foreach (string file in Directory.EnumerateFiles(folder, "*.*"))
-            {
-                //convert commercial
-
-                string new_file = output_folder + Path.GetFileNameWithoutExtension(file.ToString()) + ".mp4";
-
-                if (File.Exists(new_file) == false)
+                File.SetAttributes(commSrc, FileAttributes.Normal);
+                try
                 {
-                    string[] temp = getDurationAndAudioFilter(file);
-                    Console.WriteLine(temp[1]);
-                    //proc.StartInfo.Arguments = "-i " + "\"" + filename + "\"" + " -bsf:v h264_mp4toannexb -f mpegts " + audio_filter + " -vf  \"" + filter + "scale=640:480\" -r 29.97 -y -b:v 2M -ss " + breaks[i - 1].Hours + ":" + breaks[i - 1].Minutes + ":" + breaks[i - 1].Seconds + " -t 00:" + length.Minutes + ":" + length.Seconds + " " + temp_folder + "\\temp" + i.ToString() + ".mpg";
-                    //proc.StartInfo.Arguments = "-i " + "\"" + file.ToString() + "\"" + "  -bsf:v h264_mp4toannexb -f mpegts " + temp[1] + " -vf scale=640:480 -r 29.97 -y -b:v 2M " + "\"" + new_file + "\"";
-                    proc.StartInfo.Arguments = "-i \"" + file.ToString() + "\" -vcodec libx264 -crf 23 -s 640x480 -aspect 640:480 -r 29.97 -threads 4 -acodec libvo_aacenc -ab 128k -ar 32000 -async 32000 -ac 2 -scodec copy \"" + new_file + "\"";
-                    //proc.StartInfo.Arguments = "-i " + file.ToString() + " -c:v libx264 -preset slow -crf 22 -c:a copy " + new_file;
-                    proc.StartInfo.RedirectStandardError = true;
-                    proc.StartInfo.UseShellExecute = false;
-                    if (!proc.Start())
-                    {
-                        Console.WriteLine("Error starting");
-                        return;
-                    }
-                    StreamReader reader = proc.StandardError;
-                    reader = proc.StandardError;
-                    while ((line = reader.ReadLine()) != null)
-                    {
-                        Console.WriteLine(line);
-                    }
-                    proc.Close();
-                    //                    File.Delete(file.ToString());
+                    File.Move(commSrc, commDst);
                 }
-
+                catch (Exception ex)
+                {
+                    Console.WriteLine(ex.ToString());
+                }
             }
+
+            Console.WriteLine("Done!");
+            Console.WriteLine();
         }
 
         static void checkSplits(string in_path, string out_path, double threshhold, double black_level)
-        {
-            Process proc = new Process();
-            proc.StartInfo.FileName = ffmpeg_location;
-            string folder = in_path + "\\";
-            string output_folder = out_path;
-
-            //get duration
-            string line;
-            StreamReader reader;
-            Random rnd = new Random();
-
-            foreach (string file in Directory.EnumerateFiles(folder, "*.*"))
+        { //done
+            if (!Directory.Exists(in_path))
             {
-                if (Path.GetExtension(file).ToLower() != ".txt")
-                {
-                    //convert 
-                    bool auto_split = true;
-                    /*
-                    string[] lines = { };
-                    if(File.Exists(folder + Path.GetFileNameWithoutExtension(file) + ".txt")==true)
-                    {
-                        lines = File.ReadAllLines(folder + Path.GetFileNameWithoutExtension(file) + ".txt");
-                        auto_split = false;
-                    }
-
-                    if (lines[0] == "autodetect" || auto_split == true )
-                    */
-                    if (auto_split == true)
-                    {
-
-                        //List<TimeSpan> breaks = scanForCommercialBreaks(file, threshhold, 0, 0);
-                        List<TimeSpan> breaks = NEWscanForCommercialBreaks(file, threshhold, 0, 0, 0, black_level);
-
-                        foreach (TimeSpan tss in breaks)
-                        {
-                            Console.WriteLine(tss.ToString());
-                        }
-
-                        //Console.ReadKey();
-
-                        TimeSpan interval = new TimeSpan();
-                        breaks.Add(interval);
-                        foreach (TimeSpan aa in breaks)
-                        {
-                            Console.WriteLine(aa.ToString());
-                            AddLog("breaks: " + aa.ToString());
-                        }
-                        int times = breaks.Count - 1;
-                        for (int i = 1; i <= times; i++)
-                        {
-                            AddLog("Autodetected commercial. Splitting video #" + i.ToString());
-                            
-                            //TimeSpan length = breaks[i] - breaks[i - 1] - TimeSpan.ParseExact("00:00:00.500", @"hh\:mm\:ss\.fff", null);
-                            TimeSpan start = breaks[i - 1];
-                            string startStr = $"{start.Hours:D2}:{start.Minutes:D2}:{start.Seconds:D2}.{start.Milliseconds:D3}";
-
-                            string inputPath = $"\"{file}\"";
-
-                            TimeSpan length = breaks[i] - breaks[i - 1] - TimeSpan.FromMilliseconds(333);
-                            string lengthStr = $"{length.Hours:D2}:{length.Minutes:D2}:{length.Seconds:D2}.{length.Milliseconds:D3}";
-
-                            string outputName = $"{Path.GetFileNameWithoutExtension(file)}_{i:D3}_{rnd.Next(1, 999):D3}.mp4";
-                            string outputPath = $"\"{Path.Combine(output_folder, outputName)}\"";
-
-                            proc.StartInfo.Arguments = $"-ss {startStr} -i {inputPath} -c:v libx264 -r 29.97 -preset slow -b:v 800 -crf 29.97 -vf \"scale=640:480\" -t {lengthStr} {outputPath}";
-                            //proc.StartInfo.Arguments = "-ss " + breaks[i - 1].Hours.ToString().PadLeft(2, '0') + ":" + breaks[i - 1].Minutes.ToString().PadLeft(2, '0') + ":" + breaks[i - 1].Seconds.ToString().PadLeft(2, '0') + "." + breaks[i - 1].Milliseconds + " -i " + "\"" + file + "\" -c:v libx264 -r 29.97 -preset slow -b:v 800 -crf 29.97 -vf \"scale=640:480\" -t " + length.Hours.ToString().PadLeft(2, '0') + ":" + length.Minutes.ToString().PadLeft(2, '0') + ":" + length.Seconds.ToString().PadLeft(2, '0') + "." + length.Milliseconds + " \"" + output_folder + Path.GetFileNameWithoutExtension(file) + "_" + i.ToString("D3") + "_" + rnd.Next(1, 999).ToString("D3") + ".mp4\"";
-
-
-                            //proc.StartInfo.Arguments = "-ss " + breaks[i - 1].Hours.ToString().PadLeft(2, '0') + ":" + breaks[i - 1].Minutes.ToString().PadLeft(2, '0') + ":" + breaks[i - 1].Seconds.ToString().PadLeft(2, '0') + "." + breaks[i - 1].Milliseconds + " -i " + "\"" + file + "\" -c:v copy -c:a copy -t " + length.Hours.ToString().PadLeft(2, '0') + ":" + length.Minutes.ToString().PadLeft(2, '0') + ":" + length.Seconds.ToString().PadLeft(2, '0') + "." + length.Milliseconds + " \"" + output_folder + Path.GetFileNameWithoutExtension(file) + "_" + i.ToString() + "_" + rnd.Next(1, 999).ToString() + ".mp4\"";
-                            Console.WriteLine(proc.StartInfo.Arguments);
-
-                            AddLog("Split command:" + proc.StartInfo.Arguments.ToString());
-                            proc.StartInfo.RedirectStandardError = true;
-                            proc.StartInfo.UseShellExecute = false;
-                            if (!proc.Start())
-                            {
-                                Console.WriteLine("Error starting");
-                                return;
-                            }
-
-                            reader = proc.StandardError;
-                            while ((line = reader.ReadLine()) != null)
-                            {
-                                Console.WriteLine(line);
-                            }
-                            proc.Close();
-                        }
-                    }
-                    /*
-                    else
-                    {
-                        TimeSpan start = new TimeSpan();
-                        TimeSpan stop = new TimeSpan();
-                        TimeSpan diff = new TimeSpan();
-                        string[] temp = getDurationAndAudioFilter(file);
-
-                        Console.WriteLine("AudioFilter: " + temp[1]);
-                        //Console.ReadKey();
-
-                        for (int z = 1; z < lines.Length; z++)
-                        {
-                            start = TimeSpan.Parse(lines[z - 1]);
-                            stop = TimeSpan.Parse(lines[z]);
-                            diff = stop - start;
-                            string start_str = "00:" + lines[z - 1];
-                            string length_str = "00:" + diff.ToString().Substring(0, diff.ToString().LastIndexOf(":"));
-
-
-
-                            proc.StartInfo.Arguments = "-i " + "\"" + file + "\"" + " -bsf:v h264_mp4toannexb -f mpegts " + temp[1] + " -vf scale=640:480 -r 29.97 -y -b:v 2M -ss " + start_str + " -t " + length_str + " " + output_folder + Path.GetFileNameWithoutExtension(file).ToString() + rnd.Next(1, 9999).ToString() + ".mpg";
-                            proc.StartInfo.RedirectStandardError = true;
-                            proc.StartInfo.UseShellExecute = false;
-                            if (!proc.Start())
-                            {
-                                Console.WriteLine("Error starting");
-                                return;
-                            }
-                            reader = proc.StandardError;
-                            while ((line = reader.ReadLine()) != null)
-                            {
-                                Console.WriteLine(line);
-                            }
-                            proc.Close();
-
-                        }
-                    }
-                    */
-                }
-            }
-        }
-
-        static string[] getDurationAndAudioFilter(string file)
-        {
-            Process proc = new Process();
-            proc.StartInfo.FileName = ffmpeg_location;
-
-            string fname_noext = Path.GetFileNameWithoutExtension(file);
-            string fname_root = Path.GetDirectoryName(file);
-
-            string filename = file;
-            string audio_filter = "";
-            string dur = "";
-            string resolution = "";
-            AddLog("Getting Duration and Audio Filter string for " + file.ToString());
-            //get duration
-            proc.StartInfo.Arguments = "-i " + "\"" + filename + "\"" + " -vf \"blackdetect=d=2:pix_th=0.00\" -af volumedetect -f null -";
-            proc.StartInfo.RedirectStandardError = true;
-            proc.StartInfo.UseShellExecute = false;
-            if (!proc.Start())
-            {
-                Console.WriteLine("Error starting");
-            }
-            StreamReader reader = proc.StandardError;
-            string line;
-            while ((line = reader.ReadLine()) != null)
-            {
-                int a = line.IndexOf("Duration");
-                int xx = line.IndexOf("Durations");
-                if (a >= 0 && xx == -1)
-                {
-                    int b = line.IndexOf(".", a + 1);
-                    dur = line.Substring(a + 10, b - a - 10);
-                    AddLog("Found length " + dur.ToString());
-                    //Console.WriteLine("Found length " + dur.ToString());
-                    //return new string[] { dur, "5" };
-                }
-
-                a = line.IndexOf("Stream"); //get resolution of video
-                if (a >= 0)
-                {
-                    string[] parts = line.Split(new string[] { ", " }, StringSplitOptions.RemoveEmptyEntries);
-                    foreach (string dd in parts)
-                    {
-                        if (dd.IndexOf("x") >= 0) resolution = dd;
-                    }
-                }
-
-                a = line.IndexOf("max_volume: ");
-                if (a >= 0)
-                {
-                    int b = line.IndexOf("dB", a + 1);
-
-                    string num = line.Substring(a + 12, b - a - 13);
-                    double max_volume = Double.Parse(num, System.Globalization.NumberStyles.Any);
-                    if (max_volume >= 0) //too loud
-                    {
-                        AddLog("Audio is too loud, decreasing by " + Math.Abs(max_volume).ToString() + "dB");
-                        double mean = -max_volume;
-                        audio_filter = "-af \"volume=-" + Math.Abs(mean).ToString() + "dB\" ";
-                    }
-                    else
-                    {
-                        AddLog("Audio is too low, increasing by " + Math.Abs(max_volume).ToString() + "dB");
-                        double mean = max_volume;
-                        audio_filter = "-af \"volume=" + Math.Abs(mean).ToString() + "dB\" ";
-                    }
-
-                    //                    Console.WriteLine(audio_filter);
-                    //Console.ReadKey();
-                }
-                //Console.WriteLine(line);
-            }
-            //Console.ReadKey();
-            proc.Close();
-            AddLog("Filter: " + audio_filter);
-            return new string[] { dur, audio_filter };
-        }
-
-        static void joinConcat(string concat, string output_name = null)
-        {
-            emptyTemp();
-            Process proc = new Process();
-            proc.StartInfo.FileName = ffmpeg_location;
-            Random rnd = new Random();
-            string file = "random_commercials_" + rnd.Next(1, 9999).ToString() + ".mpg";
-            if (output_name != null) file = output_name;
-            string fname_noext = Path.GetFileNameWithoutExtension(file);
-            string fname_root = Path.GetDirectoryName(file);
-            string output_folder = Path.GetDirectoryName(ffmpeg_location) + "\\output\\";
-
-            AddLog("CONCAT string generated: " + concat);
-            //Console.WriteLine("-i \"concat:" + concat + "\" -c copy -f mpegts -analyzeduration 2147483647 -probesize 2147483647 -y -b:v 2M " + output_folder + fname_noext + ".mpg");
-            //Console.ReadKey();
-            //proc.StartInfo.Arguments = "-i \"concat:" + concat + "\" -c copy -f mpegts -analyzeduration 2147483647 -probesize 2147483647 -y -b:v 2M " + output_folder + fname_noext + ".mpg";
-            //proc.StartInfo.Arguments = "-i \"concat:" + concat + "\" -c:v libx264 -r 29.97 -preset slow -b:v 800 -crf 28 -c:a copy -vf \"scale=640:480,setdar=4:3\" " + "\"" + output_folder + fname_noext + ".mp4" + "\"";
-            //proc.StartInfo.Arguments = concat + " -c:v libx264 -r 29.97 -preset slow -b:v 800 -crf 28 -c:a copy -vf \"scale=640:480,setdar=4:3\" " + "\"" + output_folder + fname_noext + ".mp4" + "\"";
-            Console.Write("SSSS" + concat);
-            //Console.ReadKey();
-            File.WriteAllText("mylist.txt", concat);
-            Console.Write("AAAAAAAA" + File.ReadAllText("mylist.txt"));
-            //Console.ReadKey();
-            proc.StartInfo.Arguments = "-f concat -safe 0 -i mylist.txt -c:v libx264 -r 29.97 -preset slow -b:v 800 -crf 28 -c:a copy -vf \"scale=640:480,setdar=4:3\" " + "\"" + output_folder + fname_noext + ".mp4" + "\"";
-
-
-            AddLog(proc.StartInfo.Arguments);
-            Console.Write(proc.StartInfo.Arguments);
-            //Console.ReadKey();
-            proc.StartInfo.RedirectStandardError = true;
-            proc.StartInfo.UseShellExecute = false;
-            AddLog("Merging all files and commercials...");
-            if (!proc.Start())
-            {
-                Console.WriteLine("Error starting");
+                Console.WriteLine("Input directory does not exist: " + in_path);
                 return;
             }
-            StreamReader reader = proc.StandardError;
-            string line;
-            while ((line = reader.ReadLine()) != null)
+
+            if (!Directory.Exists(out_path))
             {
-                Console.WriteLine(line);
+                Directory.CreateDirectory(out_path);
             }
-            proc.Close();
-            AddLog("Merge complete.");
-            AddLog("Finished converting " + file.ToString());
-            Console.WriteLine("Finished!");
-        }
-
-        static string getScreenShot(string file, string pos)
-        {
-            /*
-            if (File.Exists(temp_folder + "\\screen_" + TimeSpan.Parse(pos).TotalSeconds.ToString() + ".jpg"))
-            {
-                return temp_folder + "\\screen_" + TimeSpan.Parse(pos).TotalSeconds.ToString() + ".jpg";
-            }
-            */
-
-            if (!File.Exists(file))
-            {
-                return null;
-            }
-
-            Process proc = new Process();
-            proc.StartInfo.FileName = ffmpeg_location;
-
-            string fname_noext = Path.GetFileNameWithoutExtension(file);
-            string fname_root = Path.GetDirectoryName(file);
-
-            string filename = file;
-
-            //get duration
-            //proc.StartInfo.Arguments = "-ss " + pos + " -i " + "\"" + filename + "\" -vframes 1 -q:v 2 \"" + temp_folder + "\\screen_" + TimeSpan.Parse(pos).TotalSeconds.ToString() + ".jpg\"";
-
-            /*
-            if (File.Exists(temp_folder + "\\screen_" + pos + ".jpg"))
-            {
-                File.SetAttributes(temp_folder + "\\screen_" + pos + ".jpg", FileAttributes.Normal);
-                File.Delete(temp_folder + "\\screen_" + pos + ".jpg");
-            }
-            */
 
             Random rnd = new Random();
-            string temp_file = temp_folder + "\\screen_" + pos + "_" + rnd.Next(1, 999).ToString() + "_" + rnd.Next(1, 999).ToString() + ".jpg";
-            proc.StartInfo.Arguments = "-y -ss " + pos + " -i " + "\"" + filename + "\" -vframes 1 -q:v 2 \"" + temp_file;
-            AddLog(proc.StartInfo.Arguments);
-            proc.StartInfo.RedirectStandardError = true;
-            proc.StartInfo.RedirectStandardOutput = true;
-            proc.StartInfo.UseShellExecute = false;
-            proc.StartInfo.CreateNoWindow = true;
+            List<string> files = GetFiles(in_path, file_extensions);
 
-            if (!proc.Start())
+            string vcodec = use_nvidia
+                ? $"-c:v h264_nvenc -preset {nvenc_preset} -profile:v high -level 3.1 -rc vbr -cq 22 -b:v 0 -maxrate 4M -bufsize 4M -g 60 -bf 0"
+                : "-c:v libx264 -preset fast -profile:v high -level 3.1 -crf 23 -maxrate 4M -bufsize 4M -g 60 -bf 2";
+
+            string vf = "yadif=0:-1:1,scale=640:480,setsar=1,setdar=4/3,fps=29.97";
+
+            Stopwatch batchTimer = Stopwatch.StartNew();
+
+            for (int fileIdx = 0; fileIdx < files.Count; fileIdx++)
             {
-                AddLog("Error starting");
-            }
-            StreamReader reader = proc.StandardError;
-            string line;
-            while ((line = reader.ReadLine()) != null)
-            {
-            }
-            //Console.ReadKey();
-            proc.Close();
+                string file = files[fileIdx];
+                Console.WriteLine($"\n[{fileIdx + 1}/{files.Count}] Processing: {Path.GetFileName(file)}");
+                AddLog("Scanning compilation for individual ads: " + file);
 
-            try
-            {
-                proc.Kill();
-            }
-            catch { }
+                Stopwatch fileTimer = Stopwatch.StartNew();
 
-            //return temp_folder + "\\screen_" + TimeSpan.Parse(pos).TotalSeconds.ToString() + ".jpg";
-            return temp_file;
+                List<TimeSpan> breaks = scanForCommercialBreaks(
+                    file,
+                    threshhold,
+                    wait: 0,
+                    min_time_add: 12,
+                    min_end_time: 5,
+                    black_level: black_level,
+                    addStartEnd: true
+                );
 
-
-        }
-
-        static string getVideoOption(string file, string option)
-        {
-            string fname_noext = Path.GetFileNameWithoutExtension(file);
-            string fname_root = Path.GetDirectoryName(file);
-
-            if (File.Exists(fname_root + "\\" + fname_noext + ".options"))
-            {
-                AddLog("Requesting video specific options...");
-                string[] lines = File.ReadAllLines(fname_root + "\\" + fname_noext + ".options");
-                for (int i = 0; i < lines.Count(); i++)
+                if (breaks.Count < 2)
                 {
-                    string[] opt = lines[i].Split(new string[] { "=" }, StringSplitOptions.None);
-                    if (opt[0].ToLower() == option.ToLower())
+                    Console.WriteLine("No ad transitions detected in: " + Path.GetFileName(file));
+                    continue;
+                }
+
+                int totalCuts = breaks.Count - 1;
+                Console.WriteLine($"Found {totalCuts} cuts.");
+
+                Stopwatch splitTimer = Stopwatch.StartNew();
+                int processedCuts = 0;
+
+                for (int i = 1; i <= totalCuts; i++)
+                {
+                    TimeSpan start = breaks[i - 1];
+                    TimeSpan rawLength = breaks[i] - start;
+
+                    TimeSpan length = rawLength > TimeSpan.FromMilliseconds(500)
+                        ? rawLength - TimeSpan.FromMilliseconds(333)
+                        : rawLength;
+
+                    if (length.TotalSeconds < 3.0)
                     {
-                        return opt[1];
+                        continue;
                     }
-                }
-            }
-            return null;
-        }
 
-        static bool IsNumeric(string value)
-        {
-            return value.All(char.IsNumber);
-        }
+                    string startStr = $"{start.Hours:D2}:{start.Minutes:D2}:{start.Seconds:D2}.{start.Milliseconds:D3}";
+                    string lengthStr = $"{length.Hours:D2}:{length.Minutes:D2}:{length.Seconds:D2}.{length.Milliseconds:D3}";
 
-        static void emptyTemp()
-        {
-            string folder = temp_folder;
-            List<string> files = GetFiles(folder);
-            AddLog("Cleaning up temp folder.");
-            foreach (string s in files)
-            {
-                File.Delete(s);
-            }
-        }
+                    string baseName = Path.GetFileNameWithoutExtension(file);
+                    string outputName = $"{baseName}_{i:D3}_{rnd.Next(1, 999):D3}.mp4";
+                    string targetPath = Path.Combine(out_path, outputName);
 
-        static void joinVideos()
-        {
-            emptyTemp();
-            Process proc = new Process();
-            proc.StartInfo.FileName = ffmpeg_location;
-            AddLog("Checking for files to join...");
-
-            string output_folder = Path.GetDirectoryName(ffmpeg_location) + "\\output\\";
-            string folder = Path.GetDirectoryName(ffmpeg_location) + "\\join\\";
-            string fname_noext = "";
-            List<string> files = GetFiles(folder);
-            if (files.Count == 0) return;
-            string concat = "";
-            string line;
-            StreamReader reader;
-
-            /*
-            AddLog("Renaming join files...");
-            foreach (string s in files)
-            {
-                if (("a" + s).IndexOf(" ") > 0)
-                {
-                    File.Move(s, s.Replace(" ", "-"));
-                }
-            }
-            */
-            files = GetFiles(folder);
-
-            /*
-
-            int i = 0;
-            files = files.OrderBy(o => o.ToString()).ToList();
-            foreach (string s in files)
-            {
-                if (Path.GetExtension(s).ToLower() != ".mpg")
-                {
-                    string[] info = getDurationAndAudioFilter(s);
-                    AddLog(i.ToString() + ") Converting " + s);
-                    proc.StartInfo.Arguments = "-i " + s + " -bsf:v h264_mp4toannexb -f mpegts -vf scale=640:480 -r 29.97 -y -b:v 2M " + temp_folder + "\\temp" + i.ToString() + ".mpg";
-                    proc.StartInfo.RedirectStandardError = true;
-                    proc.StartInfo.UseShellExecute = false;
-                    if (!proc.Start())
+                    // Format ETA string based on completed segments in this file
+                    string etaString = "Estimating...";
+                    if (processedCuts > 0)
                     {
-                        Console.WriteLine("Error starting");
-                        return;
+                        double msPerCut = splitTimer.Elapsed.TotalMilliseconds / processedCuts;
+                        int remainingCuts = totalCuts - i + 1;
+                        TimeSpan eta = TimeSpan.FromMilliseconds(msPerCut * remainingCuts);
+                        etaString = $"~{eta.Minutes:D2}m {eta.Seconds:D2}s remaining";
                     }
-                    reader = proc.StandardError;
-                    while ((line = reader.ReadLine()) != null)
+
+                    TimeSpan fileElapsed = fileTimer.Elapsed;
+                    Console.Write($"\rExtracting cut {i}/{totalCuts} ({Math.Round(length.TotalSeconds)}s) | Elapsed: {fileElapsed.Minutes:D2}:{fileElapsed.Seconds:D2} | ETA: {etaString}   ");
+
+                    AddLog($"Exporting video #{i}: Start {startStr}, Duration {lengthStr} -> {outputName}");
+
+                    string args = $"-y -ss {startStr} -i \"{file}\" -t {lengthStr} {vcodec} " +
+                                  $"-pix_fmt yuv420p -vsync cfr -vf \"{vf}\" " +
+                                  $"-c:a aac -b:a 128k -ar 48000 -ac 2 " +
+                                  $"-af \"aresample=async=1:first_pts=0\" " +
+                                  $"-movflags +faststart \"{targetPath}\"";
+
+                    ProcessStartInfo psi = new ProcessStartInfo
                     {
-                        Console.WriteLine(line);
+                        FileName = ffmpeg_location,
+                        Arguments = args,
+                        RedirectStandardError = true,
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    };
+
+                    using (Process proc = Process.Start(psi))
+                    {
+                        if (proc == null) continue;
+                        proc.StandardError.ReadToEnd();
+                        proc.WaitForExit();
                     }
-                    proc.Close();
-                }
-                else
-                {
-                    Console.WriteLine("Copying file #" + i.ToString());
-                    AddLog(i.ToString() + ") No need to convert " + s + ", copying instead");
-                    File.Copy(s, "" + temp_folder + "\\temp" + i.ToString() + ".mpg");
+
+                    processedCuts++;
                 }
 
-                i++;
-
-            }
-            files = GetFiles(temp_folder);
-
-            AddLog("Generating CONCAT string...");
-            
-            foreach (string s in files)
-            {
-                if (File.Exists(s))
-                {
-                    fname_noext += Path.GetFileNameWithoutExtension(s) + "_";
-                    concat += s + "|";
-                }
-                else
-                {
-                    AddLog("Could not find file " + s);
-                }
-
-            }
-            */
-
-            int i = 0;
-            foreach (string s in files)
-            {
-                if (File.Exists(s))
-                {
-                    concat += "file " + s.Replace("\\", "\\\\") + "\r\n";
-                    i++;
-                }
-                else
-                {
-                    AddLog("Could not find file " + s);
-                }
-
+                fileTimer.Stop();
+                Console.WriteLine($"\nFinished file in {fileTimer.Elapsed.Minutes}m {fileTimer.Elapsed.Seconds}s.");
             }
 
-            File.WriteAllText(output_folder + "files.txt", concat);
-
-            while (File.Exists(output_folder + "files.txt") == false)
-            {
-                Console.WriteLine("Waiting for file to write...");
-            }
-
-
-            if (File.Exists(output_folder + "files.txt") == false)
-            {
-                Console.WriteLine("File no exists!!!!!!!!!!!!!!!!!!");
-            }
-
-            concat = concat.Substring(0, concat.Length - 1);
-            AddLog("CONCAT string generated: " + concat);
-            Console.WriteLine("-i \"concat:" + concat + "\" -c copy -f mpegts -analyzeduration 2147483647 -probesize 2147483647 -y -b:v 2M " + output_folder + "joined_" + i.ToString() + "_files.mpg");
-            //Console.ReadKey();
-            //proc.StartInfo.Arguments = "-i \"concat:" + concat + "\" -c copy -f mpegts -analyzeduration 2147483647 -probesize 2147483647 -y -b:v 2M " + "\"" + output_folder + "joined_" + i.ToString() + "_files.mpg" + "\"";
-            proc.StartInfo.Arguments = "-f concat -i \"" + output_folder + "files.txt\" -c copy \"" + output_folder + "joined_" + i.ToString() + "_files.mp4" + "\"";
-
-            proc.StartInfo.RedirectStandardError = true;
-            proc.StartInfo.UseShellExecute = false;
-            AddLog("Merging all files and commercials...");
-            if (!proc.Start())
-            {
-                Console.WriteLine("Error starting");
-                return;
-            }
-            reader = proc.StandardError;
-            while ((line = reader.ReadLine()) != null)
-            {
-                Console.WriteLine(line);
-            }
-            proc.Close();
-            Console.WriteLine("Cleaning up temp files...");
-            AddLog("Merge complete. Cleaning up temp files...");
-            AddLog("Finished converting " + fname_noext.ToString());
-            Console.WriteLine("Finished!");
-            return;
-
+            batchTimer.Stop();
+            Console.WriteLine($"\nCompilation splitting complete. Total batch runtime: {batchTimer.Elapsed.Hours}h {batchTimer.Elapsed.Minutes}m {batchTimer.Elapsed.Seconds}s.");
         }
 
         static TimeSpan getVideoDuration(string file)
-        {
-            Process proc = new Process();
-            proc.StartInfo.FileName = ffmpeg_location;
+        { //done
+            AddLog("Getting Duration " + file);
 
-            string filename = file;
-            string dur = "";
-            AddLog("Getting Duration " + file.ToString());
-            //get duration
-            proc.StartInfo.Arguments = "-i " + "\"" + filename + "\"" + " -f null -";
-            proc.StartInfo.RedirectStandardError = true;
-            proc.StartInfo.UseShellExecute = false;
-            if (!proc.Start())
+            ProcessStartInfo psi = new ProcessStartInfo
             {
-                Console.WriteLine("Error starting");
-            }
-            StreamReader reader = proc.StandardError;
-            string line;
-            while ((line = reader.ReadLine()) != null)
+                FileName = ffmpeg_location,
+                Arguments = $"-i \"{file}\" -f null -",
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using (Process proc = Process.Start(psi))
             {
-                int a = line.IndexOf("Duration");
-                int xx = line.IndexOf("Durations");
-                if (a >= 0 && xx == -1)
+                if (proc == null)
                 {
-                    int b = line.IndexOf(",", a + 1);
-                    dur = line.Substring(a + 10, b - a - 10);
-                    AddLog("Found length " + dur.ToString());
-                    while (true)
-                    {
-                        try
-                        {
-                            proc.Kill();
-                            break;
-                        }
-                        catch
-                        { }
-                    }
-                    //proc.Close();
-                    return TimeSpan.Parse(dur);
-                    //Console.WriteLine("Found length " + dur.ToString());
-                    //return new string[] { dur, "5" };
+                    Console.WriteLine("Error starting FFmpeg");
+                    return TimeSpan.Zero;
                 }
 
+                string line;
+                while ((line = proc.StandardError.ReadLine()) != null)
+                {
+                    int a = line.IndexOf("Duration");
+                    int xx = line.IndexOf("Durations");
+
+                    if (a >= 0 && xx == -1)
+                    {
+                        int b = line.IndexOf(",", a + 1);
+                        if (b > a + 10)
+                        {
+                            string dur = line.Substring(a + 10, b - a - 10).Trim();
+                            AddLog("Found length " + dur);
+
+                            // Execute battle-tested instant kill
+                            try
+                            {
+                                if (!proc.HasExited)
+                                    proc.Kill();
+                            }
+                            catch { }
+
+                            if (TimeSpan.TryParse(dur, out TimeSpan parsedSpan))
+                            {
+                                return parsedSpan;
+                            }
+                        }
+                    }
+                }
             }
-            //Console.ReadKey();
-            proc.Close();
-            return new TimeSpan();
+
+            return TimeSpan.Zero;
         }
 
         static void MoveTaggedFiles(string dir)
-        {
-            var tags = new Dictionary<string, string> { { "%AM%", "am" }, { "%PM%", "pm" }, { "%ANY%", "any" } };
-            Console.WriteLine("Searcing for tagged files in " + dir);
-            foreach (var file in Directory.GetFiles(dir))
+        { //done
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
             {
-                var name = Path.GetFileName(file);
+                Console.WriteLine("Directory does not exist: " + dir);
+                return;
+            }
 
-                foreach (var tag in tags.Keys)
+            var tags = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "%AM%", "am" },
+                { "%PM%", "pm" },
+                { "%ANY%", "any" }
+            };
+
+            Console.WriteLine("Searching for tagged files in: " + dir);
+
+            foreach (string file in Directory.GetFiles(dir))
+            {
+                string name = Path.GetFileName(file);
+
+                foreach (var kvp in tags)
                 {
-                    if (name.IndexOf(tag, StringComparison.OrdinalIgnoreCase) >= 0)
+                    if (name.IndexOf(kvp.Key, StringComparison.OrdinalIgnoreCase) >= 0)
                     {
-                        
-                        var sub = Path.Combine(dir, tags[tag]);
-                        Directory.CreateDirectory(sub);
-                        Console.WriteLine("Moving file " + file + " to " + Path.Combine(sub, name));
-                        File.Move(file, Path.Combine(sub, name));
+                        string targetDir = Path.Combine(dir, kvp.Value);
+                        Directory.CreateDirectory(targetDir);
+
+                        string destPath = Path.Combine(targetDir, name);
+
+                        if (File.Exists(destPath))
+                        {
+                            Console.WriteLine($"Destination exists, skipping: {destPath}");
+                            break;
+                        }
+
+                        try
+                        {
+                            File.SetAttributes(file, FileAttributes.Normal);
+                            File.Move(file, destPath);
+                            Console.WriteLine($"Moved: {name} ==> {kvp.Value}\\");
+
+                            // Move matching .commercials sidecar if it exists
+                            string sidecar = file + ".commercials";
+                            string sidecarDest = destPath + ".commercials";
+                            if (File.Exists(sidecar))
+                            {
+                                File.SetAttributes(sidecar, FileAttributes.Normal);
+                                File.Move(sidecar, sidecarDest);
+                                Console.WriteLine($"Moved sidecar: {Path.GetFileName(sidecar)} ==> {kvp.Value}\\");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Failed to move {name}: {ex.Message}");
+                        }
+
                         break;
                     }
                 }
             }
+
+            Console.WriteLine("Finished moving tagged files.\n");
         }
-        static List<TimeSpan> NEWscanForCommercialBreaks(string file, double threshhold, double wait, int min_time_add = 300, int min_end_time = 59, double black_level=0.05, bool addStartEnd = true)
-        {
+
+        static List<TimeSpan> scanForCommercialBreaks(string file, double threshhold, double wait, int min_time_add = 300, int min_end_time = 59, double black_level = 0.05, bool addStartEnd = true)
+        { //done
             TimeSpan vid_dur = getVideoDuration(file);
 
-            Process proc = new Process();
-            proc.StartInfo.FileName = ffmpeg_location;
+            // Invariant formatting guarantees '.' is used for decimals regardless of Windows locale
+            string sThresh = threshhold.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            string sBlack = black_level.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
-            string fname_noext = Path.GetFileNameWithoutExtension(file);
-            string fname_root = Path.GetDirectoryName(file);
-
-            string filename = file;
-
-            //get duration
-            proc.StartInfo.Arguments = "-i \"" + filename + "\" -vf \"blackdetect=d=" + threshhold.ToString() + ":pix_th=" + black_level.ToString() + "\" -an -f null -";
-            AddLog("scanForCommercialBreaks:" + proc.StartInfo.Arguments);
-
-            proc.StartInfo.RedirectStandardError = true;
-            proc.StartInfo.UseShellExecute = false;
-            if (!proc.Start())
+            ProcessStartInfo psi = new ProcessStartInfo
             {
-                AddLog("Error starting");
-            }
-            StreamReader reader = proc.StandardError;
+                FileName = ffmpeg_location,
+                Arguments = $"-i \"{file}\" -vf \"blackdetect=d={sThresh}:pix_th={sBlack}\" -an -f null -",
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            AddLog("scanForCommercialBreaks:" + psi.Arguments);
+
             List<TimeSpan> nums = new List<TimeSpan>();
-            if(addStartEnd) nums.Add(TimeSpan.FromSeconds(0));
-            
-            string line;
-            AddLog("Scanning for Commercial Breaks...");
-            DateTime now = DateTime.Now;
-            //nums.Add(TimeSpan.FromSeconds(0));
-            double last_break = 0;
-            while ((line = reader.ReadLine()) != null)
-            {
+            if (addStartEnd) nums.Add(TimeSpan.FromSeconds(0));
 
-                if ((DateTime.Now - now) > TimeSpan.FromSeconds(.25))
+            using (Process proc = Process.Start(psi))
+            {
+                if (proc == null)
                 {
-                    //drawn a placeholder so the user doesn't think the process locked up
-                    Console.Write(".");
-                    now = DateTime.Now;
+                    AddLog("Error starting FFmpeg process");
+                    if (addStartEnd) nums.Add(TimeSpan.FromSeconds(vid_dur.TotalSeconds));
+                    return nums;
                 }
 
-                //AddLog(line.ToString());
-                int a = line.IndexOf("blackdetect");
-                if (a >= 0)
+                AddLog("Scanning for Commercial Breaks...");
+                DateTime now = DateTime.Now;
+                double last_break = 0;
+                string line;
+
+                while ((line = proc.StandardError.ReadLine()) != null)
                 {
-                    a = line.IndexOf("black_start:");
-                    int b = line.IndexOf(" ", a + 1);
-                    double bstart = Convert.ToDouble(line.Substring(a + 12, b - a - 12));
-
-                    a = line.IndexOf("black_end:", b + 1);
-                    b = line.IndexOf(" ", a + 1);
-                    double bend = Convert.ToDouble(line.Substring(a + 10, b - a - 10));
-
-                    a = line.IndexOf("black_duration:", b + 1);
-                    b = line.Length;
-                    double bdur = Convert.ToDouble(line.Substring(a + 15, b - a - 15));
-
-                    double bmed = bstart + (bdur / 2);
-
-                    //AddLog(bmed + " - " + wait);
-                    //commercial breaks must start after the minimum wait time and be less than video length minus minimum end time
-                    if (bmed > wait && ((vid_dur.TotalSeconds - bmed) > min_end_time))
+                    if ((DateTime.Now - now) > TimeSpan.FromSeconds(0.25))
                     {
-                        //time between breaks must be longer than the set minimum time
-                        if (((bmed - last_break) > min_time_add))
-                        {
-                            nums.Add(TimeSpan.FromSeconds(bmed));
-                            last_break = bmed;
-                            Console.Write("+" + TimeSpan.FromSeconds(bmed).ToString());
-                        }
-                        else if (nums.Count == 0) //we should add first break regardless of minimun time difference 
-                        {
-                            nums.Add(TimeSpan.FromSeconds(bmed));
-                            last_break = bmed;
-                            Console.Write("+" + TimeSpan.FromSeconds(bmed).ToString());
-                        }
-                        else
-                        {
-                            Console.Write("x");
-                        }
+                        Console.Write(".");
+                        now = DateTime.Now;
                     }
 
-                    //AddLog("start: " + TimeSpan.FromSeconds(bstart).ToString() + " end: " + TimeSpan.FromSeconds(bend).ToString() + " median: " + TimeSpan.FromSeconds(bmed).ToString() + " duration: " + bdur);
+                    if (line.Contains("blackdetect"))
+                    {
+                        int a = line.IndexOf("black_start:");
+                        int b = line.IndexOf(" ", a + 1);
+                        if (a == -1 || b <= a + 12) continue;
+
+                        string sStart = line.Substring(a + 12, b - a - 12);
+
+                        a = line.IndexOf("black_end:", b + 1);
+                        b = line.IndexOf(" ", a + 1);
+                        if (a == -1 || b <= a + 10) continue;
+
+                        string sEnd = line.Substring(a + 10, b - a - 10);
+
+                        a = line.IndexOf("black_duration:", b + 1);
+                        if (a == -1 || line.Length <= a + 15) continue;
+
+                        string sDur = line.Substring(a + 15);
+
+                        if (!double.TryParse(sStart, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double bstart) ||
+                            !double.TryParse(sEnd, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double bend) ||
+                            !double.TryParse(sDur, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double bdur))
+                        {
+                            continue;
+                        }
+
+                        double bmed = bstart + (bdur / 2.0);
+
+                        // Exact original timing checks and logic branches
+                        if (bmed > wait && ((vid_dur.TotalSeconds - bmed) > min_end_time))
+                        {
+                            if ((bmed - last_break) > min_time_add)
+                            {
+                                nums.Add(TimeSpan.FromSeconds(bmed));
+                                last_break = bmed;
+                                Console.Write("+" + TimeSpan.FromSeconds(bmed).ToString());
+                            }
+                            else if (nums.Count == 0)
+                            {
+                                nums.Add(TimeSpan.FromSeconds(bmed));
+                                last_break = bmed;
+                                Console.Write("+" + TimeSpan.FromSeconds(bmed).ToString());
+                            }
+                            else
+                            {
+                                Console.Write("x");
+                            }
+                        }
+                    }
                 }
+
+                try
+                {
+                    if (!proc.HasExited) proc.Kill();
+                }
+                catch { }
             }
+
             Console.WriteLine();
-            AddLog("Finished scan..... found " + nums.Count.ToString() + " breaks");
-            try
-            {
-                proc.Kill();
-            }
-            catch
-            {
+            AddLog("Finished scan..... found " + nums.Count + " breaks");
 
-            }
-            try
-            {
-                proc.Close();
-            }
-            catch
-            {
-
-            }
-            //
             if (addStartEnd) nums.Add(TimeSpan.FromSeconds(vid_dur.TotalSeconds));
             return nums;
-
-            //return commerical_breaks;
         }
-
-        static List<TimeSpan> scanForCommercialBreaks(string file, double threshhold, double wait, int min_time_add = 300)
-        {
-            Process proc = new Process();
-            proc.StartInfo.FileName = ffmpegX_location;
-
-            string fname_noext = Path.GetFileNameWithoutExtension(file);
-            string fname_root = Path.GetDirectoryName(file);
-
-            string filename = file;
-
-            //get duration
-            proc.StartInfo.Arguments = "-i " + "\"" + filename + "\"" + " -vf blackframe -an -f null -";
-            AddLog("scanForCommercialBreaks:" + proc.StartInfo.Arguments);
-            //proc.StartInfo.Arguments = "-i " + "\"" + filename + "\"" + " -vf select='gte(scene,0)' -an -f null -";
-
-            proc.StartInfo.RedirectStandardError = true;
-            proc.StartInfo.UseShellExecute = false;
-            if (!proc.Start())
-            {
-                Console.WriteLine("Error starting");
-            }
-            StreamReader reader = proc.StandardError;
-            List<TimeSpan> nums = new List<TimeSpan>();
-            string line;
-            string last_num = "";
-            Console.WriteLine("Scanning for Commercial Breaks...");
-            DateTime now = DateTime.Now;
-            while ((line = reader.ReadLine()) != null)
-            {
-                if ((DateTime.Now - now) > TimeSpan.FromSeconds(.5))
-                {
-                    Console.Write("_");
-                    now = DateTime.Now;
-                }
-                int a = line.IndexOf("Parsed_blackframe");
-                if (a >= 0)
-                {
-                    a = line.IndexOf(" t:");
-                    int b = line.IndexOf(" ", a + 1);
-                    string num = line.Substring(a + 3, b - a - 3);
-                    if (last_num != "")
-                    {
-                        //
-                        if (Double.Parse(num) - Double.Parse(last_num) > 2) nums.Add(TimeSpan.FromSeconds(0));
-                    }
-                    last_num = num;
-                    //see if the commercial break is before "wait" in seconds, this can be set to avoid going to commercial break too soon after a show starts
-                    if (Double.Parse(num) > wait)
-                    {
-                        nums.Add(TimeSpan.FromSeconds(Double.Parse(num)));
-                        Console.Write(".");
-                    }
-                    else
-                    {
-                        //black_frame was found before wait time
-                        Console.Write("<");
-                    }
-
-                }
-                else
-                {
-                    if (nums.Count > 0)
-                    {
-                        if (nums[nums.Count - 1].TotalSeconds != 0)
-                        {
-                            nums.Add(TimeSpan.FromSeconds(0));
-                            Console.Write("+");
-                        }
-                    }
-                }
-            }
-            Console.WriteLine("#");
-            Console.WriteLine("Confirming Breaks...");
-            for (int i = 1; i < nums.Count; i++)
-            {
-                Console.WriteLine(nums[i - 1]);
-                if (nums[i - 1].TotalSeconds == 0 && nums[i].TotalSeconds == 0)
-                {
-                    nums.RemoveAt(i);
-                    Console.Write("-");
-                }
-            }
-            List<TimeSpan> commerical_breaks = new List<TimeSpan>();
-            commerical_breaks.Add(TimeSpan.FromSeconds(0));
-            int last = 0;
-            for (int i = 0; i < nums.Count; i++)
-            {
-                TimeSpan t = nums[i];
-                //Console.WriteLine(i + " - " + t.ToString());
-                if (t.TotalSeconds == 0) //start new count
-                {
-                    if (last != 0)
-                    {
-
-                        TimeSpan q = nums[last + 1];
-                        TimeSpan qa = nums[i - 1];
-                        //Console.WriteLine("Total: " + (qa - q).TotalSeconds + " - " + qa.ToString() + " - " + q.ToString());
-                        AddLog("Total: " + (qa - q).TotalSeconds + " - " + qa.ToString() + " - " + q.ToString() + " ticks:" + (qa - q).Ticks + " thresh hold:" + TimeSpan.FromSeconds(threshhold).Ticks);
-                        if ((qa - q).Ticks > TimeSpan.FromSeconds(threshhold).Ticks)
-                        {
-
-                            //Console.WriteLine("Found commercial break at " + qa.ToString());
-                            AddLog("Found commercial break between (" + q.ToString() + "," + qa.ToString() + ")");
-                            TimeSpan tdiff = qa - q;
-                            AddLog("Using difference: " + (q + new TimeSpan(tdiff.Ticks / 2)).ToString());
-                            commerical_breaks.Add((q + new TimeSpan(tdiff.Ticks / 2)));
-                            Console.Write("*");
-                        }
-                        last = i;
-                    }
-                    else
-                    {
-                        last = i;
-                    }
-                }
-
-                //Console.WriteLine(t.ToString());
-            }
-            Console.WriteLine("#");
-            Console.WriteLine("Commercial breaks found: " + commerical_breaks.Count);
-            AddLog("Commercial breaks found: " + commerical_breaks.Count);
-            //Console.ReadKey();
-            proc.Close();
-
-            TimeSpan lt = new TimeSpan(0, 0, 0);
-            List<TimeSpan> new_com = new List<TimeSpan>();
-            foreach (TimeSpan t in commerical_breaks)
-            {
-                if (t.TotalSeconds - lt.TotalSeconds > min_time_add || lt.TotalMinutes == 0 || threshhold == 0)
-                {
-                    new_com.Add(t);
-                    AddLog("New Found commercial break at " + t.ToString());
-                    //Console.WriteLine("New Found commercial break at " + t.ToString());
-                    Console.Write("!");
-                }
-
-                lt = t;
-            }
-
-            return new_com;
-
-            //return commerical_breaks;
-        }
-
-        //Path.GetDirectoryName(ffmpeg_location) + "\\output\\log.txt"
-        private static string Log_File = "";
 
         static void ResetLog()
-        {
+        { //done
+            if (string.IsNullOrEmpty(Log_File)) return;
+
             try
             {
-                if (Log_File == "") return;
-                if (File.Exists(Log_File) == false) File.Create(Log_File + "\\log.txt").Close();
-                File.WriteAllText(Log_File + "\\log.txt", string.Empty);
-            } catch(Exception ex)
+                if (!Directory.Exists(Log_File))
+                {
+                    Directory.CreateDirectory(Log_File);
+                }
+
+                string logPath = Path.Combine(Log_File, "log.txt");
+                File.WriteAllText(logPath, string.Empty);
+            }
+            catch (Exception ex)
             {
-                Console.WriteLine(ex.ToString());
+                Console.WriteLine("Error resetting log file: " + ex.Message);
             }
         }
 
         static void AddLog(string log)
-        {
-            if (Log_File == "") return;
-            File.AppendAllText(Log_File + "\\log.txt", DateTime.Now.ToString() + "    " + log + "\r\n");
+        { //done
+            if (string.IsNullOrEmpty(Log_File)) return;
+
+            try
+            {
+                string logPath = Path.Combine(Log_File, "log.txt");
+                File.AppendAllText(logPath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}    {log}{Environment.NewLine}");
+            }
+            catch
+            {
+                // Don't let a logging lockup crash the video pipeline
+            }
         }
-
-        static List<TimeSpan> breakz = new List<TimeSpan>();
-
 
         static void drawScreen(int which_one)
         {
@@ -1350,13 +839,6 @@ namespace ConsoleApplication1
                     Console.WriteLine(@" /  \ |  |  |     ||  |  |  |      |  :  ||  ||     |   [_|     |");
                     Console.WriteLine(@" \    |  |  |     ||  |  |  |       \   / |  ||     |     |     |");
                     Console.WriteLine(@"  \___|__|  |_____|____| |__|        \_/ |____|_____|_____|\___/ ");
-                    break;
-                case 4:
-                    Console.WriteLine(@" ,----.                  ,-----.                       ,--.            ");
-                    Console.WriteLine(@"'  .-./    ,---. ,--,--, |  |) /_,--.--. ,---.  ,--,--.|  |,-.  ,---.  ");
-                    Console.WriteLine(@"|  | .---.| .-. :|      \|  .-.  \  .--'| .-. :' ,-.  ||     / (  .-'  ");
-                    Console.WriteLine(@"'  '--'  |\   --.|  ||  ||  '--' /  |   \   --.\ '-'  ||  \  \ .-'  `) ");
-                    Console.WriteLine(@" `------'  `----'`--''--'`------'`--'    `----' `--`--'`--'`--'`----'  ");
                     break;
                 case 5:
                     Console.WriteLine(@" __  __  _____  _  _  ____    ____   __    ___   ___  ____  ____     ____  ____  __    ____  ___ ");
@@ -1414,14 +896,17 @@ namespace ConsoleApplication1
                     Console.WriteLine(@"Clean Ascii filenames");
                     break;
                 default:
-                    
-                    var version = "0.4.3";
-                    Console.WriteLine(@"____   ____.__    .___            _________      .__  .__  __   ");
-                    Console.WriteLine(@"\   \ /   /|__| __| _/____  ____ /   _____/_____ |  | |__|/  |_ ");
-                    Console.WriteLine(@" \   Y   / |  |/ __ |/ __ \/  _ \\_____  \\____ \|  | |  \   __\");
-                    Console.WriteLine(@"  \     /  |  / /_/ \  ___(  <_> )        \  |_> >  |_|  ||  |  ");
-                    Console.WriteLine(@"   \___/   |__\____ |\___  >____/_______  /   __/|____/__||__|  ");
-                    Console.WriteLine(@"                   \/    \/             \/|__|                  ");
+                    var version = "0.4.4";
+                    Console.WriteLine(@" _____ _    _   ____  _        _   _              ");
+                    Console.WriteLine(@"|_   _\ \  / / / ___|| |_ __ _| |_(_) ___  _ __   ");
+                    Console.WriteLine(@"  | |  \ \/ /  \___ \| __/ _` | __| |/ _ \| '_ \  ");
+                    Console.WriteLine(@"  | |   \  /    ___) | || (_| | |_| | (_) | | | | ");
+                    Console.WriteLine(@"  |_|    \/    |____/ \__\__,_|\__|_|\___/|_| |_| ");
+                    Console.WriteLine(@"    _             _     _                         ");
+                    Console.WriteLine(@"   / \   ___ ___ (_)___| |_ __ _ _ __  _|_        ");
+                    Console.WriteLine(@"  / _ \ / __/ __|| / __| __/ _` | '_ \| __|       ");
+                    Console.WriteLine(@" / ___ \\__ \__ \| \__ \ || (_| | | | | |_        ");
+                    Console.WriteLine(@"/_/   \_\___/___/|_|___/\__\__,_|_| |_|\__|       ");
                     Console.WriteLine("version: " + version.ToString());
                     Console.WriteLine("");
                     Console.WriteLine("██████████████████████████████████████████████████████████████");
@@ -1431,7 +916,6 @@ namespace ConsoleApplication1
                     Console.WriteLine("█   [ 1 ] - Batch Normalize Audio   [ n ] Remove NA Mark     █");
                     Console.WriteLine("█   [ 2 ] - Print Breaks            [ u ] Remove Non-Ascii   █");
                     Console.WriteLine("█   [ 3 ] - Split Video             [ l ] Replace String     █");
-                    Console.WriteLine("█   [ 4 ] - Generate Breaks                                  █");
                     Console.WriteLine("█   [ 5 ] - Move Tagged Files                                █");
                     Console.WriteLine("█   [ 6 ] - Test Print Breaks       [ k ] Add to Filename    █");
                     Console.WriteLine("█   [ 7 ] - Time Adder              [ t ] Remove Time        █");
@@ -1469,1103 +953,828 @@ namespace ConsoleApplication1
         }
 
         static void recurse_add_duration(string dir)
-        {
-            string[] dirs = Directory.GetDirectories(dir, "*", System.IO.SearchOption.AllDirectories);
-
-            foreach(string d in dirs)
+        { //done
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
             {
-                recurse_add_duration(d);
+                Console.WriteLine("Directory does not exist: " + dir);
+                return;
             }
 
-            List<string> vidlen_files = GetFiles(dir, video_file_extensions);
+            RecurseAddDurationInternal(dir);
 
-            while (vidlen_files.Count > 0)
+            Console.WriteLine("Times have been added. Press any key to continue...");
+            Console.ReadKey(true);
+        }
+
+        static void RecurseAddDurationInternal(string currentDir)
+        { //done
+            // 1. Process all video files in this folder
+            List<string> vidlen_files = GetFiles(currentDir, file_extensions);
+            foreach (string file in vidlen_files)
             {
-                AddTimeStringToFileName(vidlen_files[0]);
-                vidlen_files.RemoveAt(0);
+                AddTimeStringToFileName(file);
             }
-            Console.WriteLine("Times have been added. Press and key to continue...");
 
+            // 2. Step strictly one level down to avoid duplicate traversal
+            try
+            {
+                string[] subDirs = Directory.GetDirectories(currentDir, "*", SearchOption.TopDirectoryOnly);
+                foreach (string subDir in subDirs)
+                {
+                    RecurseAddDurationInternal(subDir);
+                }
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Safely skip folders with restricted OS permissions
+            }
         }
 
         static string ReturnCleanASCII(string s)
-        {
-            //taken from https://stackoverflow.com/questions/62587920/remove-unwanted-unicode-characters-from-string
+        { //done
+            if (string.IsNullOrEmpty(s)) return string.Empty;
+
+            // Optional: Normalize common fancy unicode punctuation to standard ASCII equivalents
+            s = s.Replace('’', '\'')
+                 .Replace('‘', '\'')
+                 .Replace('“', '"')
+                 .Replace('”', '"')
+                 .Replace('—', '-')
+                 .Replace('–', '-');
+
             StringBuilder sb = new StringBuilder(s.Length);
+            char[] invalidChars = Path.GetInvalidFileNameChars();
+
             foreach (char c in s)
             {
-                if ((int)c > 127) // you probably don't want 127 either
-                    continue;
-                if ((int)c < 32)  // I bet you don't want control characters 
-                    continue;
-                if (c == '?')
-                    continue;
+                // Strip non-ASCII or control characters
+                if (c < 32 || c > 126) continue;
+
+                // Strip illegal filename characters (includes '?', '<', '>', ':', '"', '/', '\', '|', '*')
+                if (Array.IndexOf(invalidChars, c) >= 0) continue;
+
                 sb.Append(c);
             }
 
+            return sb.ToString().Trim();
+        }
 
-            return sb.ToString();
+        static void LoadSettings(string settingsFile)
+        { //done
+
+            if (!File.Exists(settingsFile)) return;
+
+            string[] lines = File.ReadAllLines(settingsFile);
+            foreach (string rawLine in lines)
+            {
+                string line = rawLine.Trim();
+                if (string.IsNullOrEmpty(line) || line.StartsWith("#")) continue;
+
+                string[] opt = line.Split(new[] { '=' }, 2);
+                if (opt.Length < 2) continue;
+
+                string key = opt[0].Trim().ToLower();
+                string val = opt[1].Trim();
+
+                switch (key)
+                {
+                    case "ffmpeg location":
+                        Console.WriteLine("Setting FFMPEG location to " + val);
+                        ffmpeg_location = val;
+                        break;
+
+                    case "temp folder":
+                        Console.WriteLine("Setting Temp Folder to " + val);
+                        temp_folder = val;
+                        break;
+
+                    case "log file":
+                        Console.WriteLine("Setting Log File location to " + val);
+                        Log_File = val;
+                        break;
+
+                    case "use nvidia":
+                        use_nvidia = val.Equals("true", StringComparison.OrdinalIgnoreCase);
+                        Console.WriteLine("Setting NVIDIA Hardware Acceleration to " + (use_nvidia ? "ENABLED" : "DISABLED"));
+                        break;
+                }
+            }
+        }
+
+        static bool HandleCommandLineArguments(string[] args)
+        {
+            if (args == null || args.Length == 0)
+                return false;
+
+            bool cliHandled = false;
+
+            try
+            {
+                for (int i = 0; i < args.Length; i++)
+                {
+                    string flag = args[i].ToLower().Trim();
+
+                    if (flag == "--normalize" || flag == "-n")
+                    {
+                        cliHandled = true;
+
+                        if (i + 1 >= args.Length)
+                        {
+                            Console.WriteLine("Error: Missing file path after " + args[i]);
+                            break;
+                        }
+
+                        string filePath = args[i + 1];
+
+                        if (File.Exists(filePath))
+                        {
+                            if (filePath.IndexOf("_NA_", StringComparison.OrdinalIgnoreCase) > -1)
+                            {
+                                Console.WriteLine(filePath + " has already been normalized.");
+                            }
+                            else
+                            {
+                                Console.WriteLine("Normalizing file: " + filePath);
+                                NormalizeAudio(filePath, true);
+
+                                while (Normalizing)
+                                {
+                                    Console.WriteLine("Normalizing...");
+                                    System.Threading.Thread.Sleep(3000);
+                                }
+
+                                Console.WriteLine("Normalization complete.");
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine(filePath + " does not exist.");
+                        }
+
+                        i++; // Skip the file path on next loop iteration
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("CLI Error: " + ex.Message);
+                return true;
+            }
+
+            return cliHandled;
+        }
+
+        static string PromptPath(string prompt, bool mustExist = true, bool isFile = false)
+        {
+            Console.WriteLine(prompt);
+            Console.Write("> ");
+            string input = Console.ReadLine()?.Trim() ?? "";
+
+            if (string.IsNullOrEmpty(input)) return "";
+
+            // Strip quotation marks if user dragged and dropped a folder/file into the terminal
+            input = input.Trim('"', '\'');
+
+            if (mustExist)
+            {
+                bool exists = isFile ? File.Exists(input) : Directory.Exists(input);
+                if (!exists)
+                {
+                    drawMessage((isFile ? "File" : "Path") + " does not exist: " + input);
+                    return null; // Signals invalid input
+                }
+            }
+
+            return input;
+        }
+
+        static double PromptDouble(string prompt, double defaultValue)
+        {
+            Console.WriteLine();
+            Console.WriteLine($"{prompt} [Default: {defaultValue}]");
+            Console.Write("> ");
+            string input = Console.ReadLine()?.Trim() ?? "";
+
+            if (double.TryParse(input, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double val))
+                return val;
+
+            return defaultValue;
+        }
+
+        static int PromptInt(string prompt, int defaultValue)
+        {
+            Console.WriteLine();
+            Console.WriteLine($"{prompt} [Default: {defaultValue}]");
+            Console.Write("> ");
+            string input = Console.ReadLine()?.Trim() ?? "";
+
+            if (int.TryParse(input, out int val))
+                return val;
+
+            return defaultValue;
+        }
+
+        static bool PromptBool(string prompt, bool defaultVal = false)
+        {
+            Console.WriteLine();
+            Console.WriteLine($"{prompt} ([Y]es / [N]o) [Default: {(defaultVal ? "Y" : "N")}]");
+            Console.Write("> ");
+            string input = Console.ReadLine()?.Trim().ToLower() ?? "";
+
+            if (string.IsNullOrEmpty(input)) return defaultVal;
+            return input.StartsWith("y");
+        }
+
+        static void ProcessAudioNormalizationMenu()
+        {
+            drawScreen(1);
+
+            List<string> paths = new List<string>();
+            bool addPaths = true;
+
+            while (addPaths)
+            {
+                addPaths = false;
+                string folder = PromptPath("Enter path to video files (leave blank to finish queue, prefix with '+' to add more):", false);
+                if (string.IsNullOrEmpty(folder)) break;
+
+                if (folder.StartsWith("+"))
+                {
+                    folder = folder.Substring(1).Trim('"', '\'');
+                    addPaths = true;
+                }
+
+                if (!Directory.Exists(folder))
+                {
+                    drawMessage("Path does not exist: " + folder);
+                }
+                else
+                {
+                    paths.Add(folder);
+                    Console.WriteLine($"\n{folder} added to queue ({paths.Count} total)\n");
+                }
+            }
+
+            if (paths.Count == 0) return;
+
+            TimeSpan totalFilter = TimeSpan.Zero;
+            TimeSpan totalApply = TimeSpan.Zero;
+
+            foreach (string folder in paths)
+            {
+                List<string> files = GetFiles(folder, file_extensions, new[] { "_NA_" });
+                int totalFiles = files.Count;
+                int processed = 0;
+
+                for (int i = 0; i < files.Count; i++)
+                {
+                    string file = files[i];
+                    drawScreen(1);
+
+                    TimeSpan elapsed = totalFilter + totalApply;
+                    double avgSeconds = processed > 0 ? elapsed.TotalSeconds / processed : 0;
+                    TimeSpan eta = TimeSpan.FromSeconds(avgSeconds * (totalFiles - processed));
+
+                    Console.WriteLine($"ETA: {eta:hh\\:mm\\:ss} | Elapsed: {elapsed:hh\\:mm\\:ss}\n");
+                    Console.WriteLine($"Normalizing audio: {Path.GetFileName(file)}");
+                    Console.WriteLine($"File {i + 1} of {totalFiles}\n");
+
+                    TimeSpan[] runTimes = NormalizeAudio(file);
+                    totalFilter += runTimes[0];
+                    totalApply += runTimes[1];
+
+                    if (runTimes[0].TotalSeconds > 0) processed++;
+                }
+            }
+
+            TimeSpan totalNorm = totalFilter + totalApply;
+            drawMessage($"Normalization complete!\nTotal runtime: {totalNorm:hh\\:mm\\:ss}");
+        }
+
+        static void ProcessPrintBreaksMenu()
+        {
+            drawScreen(2);
+            string printFolder = PromptPath("Enter path to video files: (leave blank to cancel)");
+            if (string.IsNullOrEmpty(printFolder)) return;
+
+            List<string> breakFiles = GetFiles(printFolder, file_extensions);
+            if (breakFiles.Count == 0)
+            {
+                drawMessage("No matching video files found in directory.");
+                return;
+            }
+
+            double pThresh = PromptDouble("Enter threshold (length of black frames in seconds):", 0.5);
+            double pBlack = PromptDouble("Enter black luminance (pure=0, black=0.05, light black=0.1):", 0.05);
+            int pMinComm = PromptInt("Enter minimum detected breaks required to write file:", 3);
+            double pWait = PromptDouble("Enter minimum start time (seconds from beginning):", 0.0);
+            int pMinBetween = PromptInt("Enter minimum length between breaks (seconds):", 300);
+            int pEndPad = PromptInt("Enter time from end of video to stop looking (seconds):", 0);
+            bool synthBreaks = PromptBool("Fabricate synthetic breaks if none are detected?", false);
+
+            foreach (string file in breakFiles)
+            {
+                string commercialFile = Path.Combine(printFolder, Path.GetFileName(file) + ".commercials");
+                if (File.Exists(commercialFile))
+                {
+                    AddLog("Commercials metadata already exists for: " + Path.GetFileName(file));
+                    continue;
+                }
+
+                Console.WriteLine($"\nScanning: {Path.GetFileName(file)}");
+                List<TimeSpan> cms = scanForCommercialBreaks(file, pThresh, pWait, pMinBetween, pEndPad, pBlack, false);
+
+                if (cms.Count >= pMinComm)
+                {
+                    string fileData = string.Join("\n", cms.ConvertAll(t => t.TotalSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+                    File.WriteAllText(commercialFile, fileData);
+                    AddLog("Printed breaks: " + commercialFile);
+                    Console.WriteLine($"Wrote {cms.Count} breaks.");
+                }
+                else if (synthBreaks)
+                {
+                    Console.WriteLine("Insufficient breaks found. Generating synthetic intervals...");
+                    TimeSpan dur = getVideoDuration(file);
+                    if (dur.TotalSeconds > 600)
+                    {
+                        List<string> synth = new List<string>();
+                        for (int s = 600; s < dur.TotalSeconds; s += 600)
+                            synth.Add(s.ToString());
+
+                        if (synth.Count > 0)
+                            File.WriteAllText(commercialFile, string.Join("\n", synth));
+                    }
+                }
+                else
+                {
+                    Console.WriteLine($"Found {cms.Count} breaks (under threshold of {pMinComm}). Skipped.");
+                }
+            }
+
+            Console.WriteLine("\nPress any key to continue...");
+            Console.ReadKey(true);
+            drawMessage("Print Breaks complete!");
+        }
+
+        static void ProcessSplitVideoMenu()
+        {
+            drawScreen(3);
+            string splitIn = PromptPath("Enter path to input video files:");
+            if (string.IsNullOrEmpty(splitIn)) return;
+
+            Console.WriteLine("\nEnter output path (leave blank for default '\\output\\'):");
+            Console.Write("> ");
+            string splitOut = Console.ReadLine()?.Trim('"', '\'') ?? "";
+
+            if (string.IsNullOrEmpty(splitOut))
+            {
+                splitOut = Path.Combine(splitIn, "output");
+                if (!Directory.Exists(splitOut))
+                    Directory.CreateDirectory(splitOut);
+            }
+            else if (!Directory.Exists(splitOut))
+            {
+                drawMessage("Output directory does not exist: " + splitOut);
+                return;
+            }
+
+            double sThresh = PromptDouble("Enter threshold (length of black dip in seconds):", 0.5);
+            double sBlack = PromptDouble("Enter black level (e.g. 0.05):", 0.05);
+
+            checkSplits(splitIn, splitOut, sThresh, sBlack);
+
+            drawMessage("Splits complete!");
+            AddLog("Splits complete for: " + splitIn);
+        }
+
+        static void ProcessMoveTaggedFilesMenu()
+        {
+            drawScreen(5);
+            string bbarsFolder = PromptPath("Enter path to video files:");
+            if (string.IsNullOrEmpty(bbarsFolder)) return;
+
+            MoveTaggedFiles(bbarsFolder);
+
+            Console.WriteLine("\nFile moving complete. Press any key to continue...");
+            Console.ReadKey(true);
+        }
+
+        static void ProcessTestSingleBreakScanMenu()
+        {
+            drawScreen(6);
+            string testFile = PromptPath("Enter path to single video file:", mustExist: true, isFile: true);
+            if (string.IsNullOrEmpty(testFile)) return;
+
+            double tThresh = PromptDouble("Enter threshold (default 0.5s):", 0.5);
+            double tBlack = PromptDouble("Enter black luminance (default 0.10):", 0.10);
+            double tWait = PromptDouble("Enter minimum start time (default 0s):", 0);
+            int tLength = PromptInt("Enter minimum spacing between breaks (default 300s):", 300);
+            int tEnd = PromptInt("Enter end cutoff padding (default 0s):", 0);
+
+            Console.WriteLine("\nScanning for commercials...");
+            List<TimeSpan> testBreaks = scanForCommercialBreaks(testFile, tThresh, tWait, tLength, tEnd, tBlack, false);
+
+            Console.WriteLine($"\nFound {testBreaks.Count} commercial(s):");
+            foreach (TimeSpan t in testBreaks)
+                Console.WriteLine($"Break at: {t:hh\\:mm\\:ss\\.fff} ({Math.Round(t.TotalSeconds, 2)}s)");
+
+            Console.WriteLine("\nPress any key to return to menu...");
+            Console.ReadKey(true);
+        }
+
+        static void ProcessAddDurationToFilenamesMenu()
+        {
+            drawScreen(7);
+            string durFolder = PromptPath("Enter path to video files:");
+            if (string.IsNullOrEmpty(durFolder)) return;
+
+            recurse_add_duration(durFolder);
+        }
+
+        static void ProcessSettingsMenu()
+        {
+            drawScreen(9);
+
+            string flocation = PromptSetting("Enter FFMPEG Location:", ffmpeg_location);
+            if (!File.Exists(flocation))
+            {
+                drawMessage("FFmpeg binary not found at: " + flocation);
+                return;
+            }
+            ffmpeg_location = flocation;
+
+            string tlocation = PromptSetting("Enter TEMP Path:", temp_folder);
+            if (!string.IsNullOrEmpty(tlocation) && !Directory.Exists(tlocation))
+            {
+                try { Directory.CreateDirectory(tlocation); }
+                catch (Exception ex) { Console.WriteLine("Warning: Could not create temp directory: " + ex.Message); }
+            }
+            temp_folder = tlocation;
+
+            string llocation = PromptSetting("Enter Log File Location:", Log_File);
+            if (!string.IsNullOrEmpty(llocation) && !Directory.Exists(llocation))
+            {
+                try { Directory.CreateDirectory(llocation); }
+                catch (Exception ex) { Console.WriteLine("Warning: Could not create log directory: " + ex.Message); }
+            }
+            Log_File = llocation;
+
+            Console.Write("\nTesting for NVIDIA NVENC hardware encoder... ");
+            bool nvencAvailable = DetectNvidiaEncoder();
+
+            if (nvencAvailable)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[AVAILABLE - Preset: {nvenc_preset}]");
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.DarkYellow;
+                Console.WriteLine("[NOT DETECTED / FAILED]");
+            }
+            Console.ResetColor();
+
+            use_nvidia = PromptBool("Enable NVIDIA Hardware Acceleration?", nvencAvailable);
+            Console.WriteLine("NVIDIA acceleration set to: " + (use_nvidia ? "ENABLED" : "DISABLED"));
+
+            string settingsContent =
+                $"ffmpeg location={ffmpeg_location}\n" +
+                $"temp folder={temp_folder}\n" +
+                $"log file={Log_File}\n" +
+                $"use nvidia={use_nvidia.ToString().ToLower()}\n";
+
+            File.WriteAllText("settings.txt", settingsContent);
+            drawMessage("Settings saved successfully!");
+        }
+
+        static void ProcessRemoveNormalizationMarkMenu()
+        {
+            drawScreen('n');
+            string rnaFolder = PromptPath("Enter path to files:");
+            if (string.IsNullOrEmpty(rnaFolder)) return;
+
+            foreach (string file in GetFiles(rnaFolder))
+            {
+                string name = Path.GetFileNameWithoutExtension(file);
+                if (name.Contains("_NA_"))
+                {
+                    string dir = Path.GetDirectoryName(file);
+                    string ext = Path.GetExtension(file);
+                    string newPath = Path.Combine(dir, name.Replace("_NA_", "") + ext);
+
+                    try
+                    {
+                        File.SetAttributes(file, FileAttributes.Normal);
+                        File.Move(file, newPath);
+                        Console.WriteLine($"{Path.GetFileName(file)} ==> {Path.GetFileName(newPath)}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(ex.Message);
+                    }
+                }
+            }
+
+            Console.WriteLine("\nNormalization tags removed. Press any key to continue...");
+            Console.ReadKey(true);
+        }
+
+        static void ProcessAppendPrependFilenamesMenu()
+        {
+            drawScreen('k');
+            string klaFolder = PromptPath("Enter path to files:");
+            if (string.IsNullOrEmpty(klaFolder)) return;
+
+            List<string> klaFiles = GetFiles(klaFolder);
+
+            Console.WriteLine("\nEnter string to APPEND to filenames (leave blank to skip):");
+            Console.Write("> ");
+            string appendStr = Console.ReadLine() ?? "";
+
+            if (!string.IsNullOrEmpty(appendStr))
+            {
+                foreach (string file in klaFiles)
+                {
+                    string name = Path.GetFileNameWithoutExtension(file);
+                    if (!name.Contains(appendStr))
+                    {
+                        string dir = Path.GetDirectoryName(file);
+                        string ext = Path.GetExtension(file);
+                        string newPath = Path.Combine(dir, name + appendStr + ext);
+
+                        try
+                        {
+                            File.SetAttributes(file, FileAttributes.Normal);
+                            File.Move(file, newPath);
+                            Console.WriteLine($"{Path.GetFileName(file)} ==> {Path.GetFileName(newPath)}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine(ex.Message);
+                        }
+                    }
+                }
+            }
+
+            Console.WriteLine("\nEnter string to PREPEND to filenames (leave blank to skip):");
+            Console.Write("> ");
+            string prependStr = Console.ReadLine() ?? "";
+
+            if (!string.IsNullOrEmpty(prependStr))
+            {
+                // Re-fetch files in case they were renamed in the previous step
+                foreach (string file in GetFiles(klaFolder))
+                {
+                    string name = Path.GetFileNameWithoutExtension(file);
+                    if (!name.StartsWith(prependStr))
+                    {
+                        string dir = Path.GetDirectoryName(file);
+                        string ext = Path.GetExtension(file);
+                        string newPath = Path.Combine(dir, prependStr + name + ext);
+
+                        try
+                        {
+                            File.SetAttributes(file, FileAttributes.Normal);
+                            File.Move(file, newPath);
+                            Console.WriteLine($"{Path.GetFileName(file)} ==> {Path.GetFileName(newPath)}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine(ex.Message);
+                        }
+                    }
+                }
+            }
+
+            Console.WriteLine("\nRenaming complete. Press any key to continue...");
+            Console.ReadKey(true);
+        }
+
+        static void ProcessFindReplaceFilenamesMenu()
+        {
+            drawScreen('l');
+            string rlaFolder = PromptPath("Enter path to files:");
+            if (string.IsNullOrEmpty(rlaFolder)) return;
+
+            Console.WriteLine("\nEnter string to find:");
+            Console.Write("> ");
+            string findStr = Console.ReadLine() ?? "";
+            if (string.IsNullOrEmpty(findStr)) return;
+
+            Console.WriteLine("\nEnter string to replace with:");
+            Console.Write("> ");
+            string replaceStr = Console.ReadLine() ?? "";
+
+            foreach (string file in GetFiles(rlaFolder))
+            {
+                string name = Path.GetFileNameWithoutExtension(file);
+                if (name.Contains(findStr))
+                {
+                    string dir = Path.GetDirectoryName(file);
+                    string ext = Path.GetExtension(file);
+
+                    // Preserve _NA_ tag identity during replacement
+                    string newName = name.Replace("_NA_", "|||||")
+                                         .Replace(findStr, replaceStr)
+                                         .Replace("|||||", "_NA_");
+
+                    string newPath = Path.Combine(dir, newName + ext);
+                    try
+                    {
+                        File.SetAttributes(file, FileAttributes.Normal);
+                        File.Move(file, newPath);
+                        Console.WriteLine($"{Path.GetFileName(file)} ==> {Path.GetFileName(newPath)}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(ex.Message);
+                    }
+                }
+            }
+
+            Console.WriteLine($"\nReplaced '{findStr}' with '{replaceStr}'. Press any key to continue...");
+            Console.ReadKey(true);
+        }
+
+        static void ProcessAddNormalizationMarkMenu()
+        {
+            drawScreen('m');
+            string mrnaFolder = PromptPath("Enter path to files:");
+            if (string.IsNullOrEmpty(mrnaFolder)) return;
+
+            foreach (string file in GetFiles(mrnaFolder))
+            {
+                string dir = Path.GetDirectoryName(file);
+                string ext = Path.GetExtension(file);
+                string name = Path.GetFileNameWithoutExtension(file);
+
+                if (!name.Contains("_NA_"))
+                {
+                    string targetName;
+                    if (ext.Equals(".commercials", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string innerExt = Path.GetExtension(name);
+                        string innerBase = Path.GetFileNameWithoutExtension(name);
+                        targetName = $"{innerBase}_NA_{innerExt}.commercials";
+                    }
+                    else
+                    {
+                        targetName = $"{name}_NA_{ext}";
+                    }
+
+                    string newPath = Path.Combine(dir, targetName);
+                    try
+                    {
+                        File.SetAttributes(file, FileAttributes.Normal);
+                        File.Move(file, newPath);
+                        Console.WriteLine($"{Path.GetFileName(file)} ==> {targetName}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(ex.Message);
+                    }
+                }
+            }
+
+            Console.WriteLine("\n_NA_ markers added. Press any key to continue...");
+            Console.ReadKey(true);
+        }
+
+        static void ProcessCleanAsciiFilenamesMenu()
+        {
+            drawScreen('u');
+            string urnaFolder = PromptPath("Enter path to files:");
+            if (string.IsNullOrEmpty(urnaFolder)) return;
+
+            foreach (string file in GetFiles(urnaFolder))
+            {
+                string dir = Path.GetDirectoryName(file);
+                string ext = Path.GetExtension(file);
+                string name = Path.GetFileNameWithoutExtension(file);
+                string cleanName = ReturnCleanASCII(name);
+
+                if (name != cleanName)
+                {
+                    string newPath = Path.Combine(dir, cleanName + ext);
+                    try
+                    {
+                        File.SetAttributes(file, FileAttributes.Normal);
+                        File.Move(file, newPath);
+                        Console.WriteLine($"{name}{ext} ==> {cleanName}{ext}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(ex.Message);
+                    }
+                }
+            }
+
+            Console.WriteLine("\nClean ASCII filenames complete. Press any key to continue...");
+            Console.ReadKey(true);
+        }
+
+        static void ProcessRemoveTimestampTokensMenu()
+        {
+            drawScreen('t');
+            string tnaFolder = PromptPath("Enter path to files:");
+            if (string.IsNullOrEmpty(tnaFolder)) return;
+
+            foreach (string file in GetFiles(tnaFolder))
+            {
+                string name = Path.GetFileNameWithoutExtension(file);
+                int startToken = name.IndexOf("%T(");
+                int endToken = startToken > -1 ? name.IndexOf(")%", startToken + 3) : -1;
+
+                if (startToken > -1 && endToken > -1)
+                {
+                    string dir = Path.GetDirectoryName(file);
+                    string ext = Path.GetExtension(file);
+                    string cleanedName = name.Substring(0, startToken) + name.Substring(endToken + 2);
+                    string newPath = Path.Combine(dir, cleanedName + ext);
+
+                    try
+                    {
+                        File.SetAttributes(file, FileAttributes.Normal);
+                        File.Move(file, newPath);
+                        Console.WriteLine($"{name}{ext} ==> {cleanedName}{ext}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(ex.Message);
+                    }
+                }
+            }
+
+            Console.WriteLine("\nTimestamp tokens removed. Press any key to continue...");
+            Console.ReadKey(true);
         }
 
         static void Main(string[] args)
         {
-            string app_path = AppDomain.CurrentDomain.BaseDirectory.ToString();
-            if (File.Exists(app_path + "\\settings.txt"))
-            {
-                string[] lines = File.ReadAllLines(app_path + "\\settings.txt");
-                for (int i = 0; i < lines.Count(); i++)
-                {
-                    string[] opt = lines[i].Split(new string[] { "=" }, StringSplitOptions.RemoveEmptyEntries);
-                    switch (opt[0].ToLower().Trim())
-                    {
-                        case "ffmpeg location":
-                            Console.WriteLine("Setting FFMPEG location to " + opt[1]);
-                            ffmpeg_location = opt[1];
-                            break;
-                        case "alt ffmpeg location":
-                            Console.WriteLine("Setting Alt FFMPEG location to " + opt[1]);
-                            ffmpegX_location = opt[1];
-                            break;
-                        case "temp folder":
-                            Console.WriteLine("Setting Temp Folder to " + opt[1]);
-                            temp_folder = opt[1];
-                            break;
-                        case "log file":
-                            Console.WriteLine("Setting Log File location to " + opt[1]);
-                            Log_File = opt[1];
-                            break;
-                        default:
+            string appPath = AppDomain.CurrentDomain.BaseDirectory;
+            string settingsFile = Path.Combine(appPath, "settings.txt");
 
-                            break;
-                    }
-                }
-            }
+            LoadSettings(settingsFile);
             ResetLog();
 
-            bool premature_exit = false;
-            try
+            if (HandleCommandLineArguments(args))
             {
-                
-                for (int i = 0; i < args.Count(); i++)
-                {
-                    string s = args[i];
-                    if (s == "--normalize" || s == "-n") //normalize
-                    {
-                        //Console.Clear();
-                        string f = args[i + 1];
-
-                        if (File.Exists(f))
-                        {
-                            if (f.IndexOf("_NA_") > -1)
-                            {
-                                Console.WriteLine(f + " has already been normalized");
-                            }
-                            else
-                            {
-                                Console.WriteLine("Normalizing file: " + f);
-                                premature_exit = true;
-                                NormalizeAudio(f, true);
-                                while(Normalizing)
-                                {
-                                    Application.DoEvents();
-                                    Console.WriteLine("Normalizing...");
-                                    System.Threading.Thread.Sleep(5000);
-
-                                }
-                                Console.WriteLine("Normaliztion ended");
-                            }
-                            i++;
-
-                        }
-                        else
-                        {
-
-                            Console.WriteLine(f + " doesn't exist");
-                            System.Threading.Thread.Sleep(2000);
-                            premature_exit = true;
-                        }
-                    }
-                }
+                return; // Clean exit back to command prompt / shell script
             }
-            catch(Exception exc)
-            {
-                Console.WriteLine(exc.ToString());
-                return;
-            }
-            if (premature_exit) return;
+
             System.Threading.Thread.Sleep(2000);
-            /*
-            string folder = Path.GetDirectoryName(ffmpeg_location);
 
-            if (Directory.Exists(folder + "\\shows\\") == false) Directory.CreateDirectory(folder + "\\shows\\");
-            List<string> shows = GetFiles(folder + "\\shows\\");
-            //List<string> shows = GetFiles(@\shows\");
-            if (Directory.Exists(folder + "\\output\\") == false) Directory.CreateDirectory(folder + "\\output\\");
-            List<string> finished_shows = GetFiles(folder + "\\output\\");
-            if (Directory.Exists(folder + "\\convert\\") == false) Directory.CreateDirectory(folder + "\\convert\\");
-            List<string> commercials = GetFiles(folder + "\\convert\\");
-            if (Directory.Exists(folder + "\\bopen\\") == false) Directory.CreateDirectory(folder + "\\bopen\\");
-            List<string> bumpers_open = GetFiles(folder + "\\bopen\\");
-            if (Directory.Exists(folder + "\\bclose\\") == false) Directory.CreateDirectory(folder + "\\bclose\\");
-            List<string> bumpers_close = GetFiles(folder + "\\bclose\\");
-            */
-
-            while (1 == 1)
+            while (true)
             {
-                drawScreen(0); //draw the selection screen
+                drawScreen(0);
 
-                ConsoleKeyInfo ck = Console.ReadKey();
-                char selected_option = ck.KeyChar;
-
+                ConsoleKeyInfo ck = Console.ReadKey(true);
                 if (ck.Key == ConsoleKey.Escape) Environment.Exit(0);
-                if (ffmpeg_location == "") selected_option = '9';
+
+                char selected_option = ck.KeyChar;
+                if (string.IsNullOrEmpty(ffmpeg_location)) selected_option = '9';
+
                 switch (selected_option)
                 {
                     case '1':
-                        //normalize
-                        drawScreen(1); //normalize
-
-                        List<string> paths = new List<string> { };
-                        bool add_paths = true;
-                        string normal_audio_folder = "";
-                        while (add_paths)
-                        {
-                            add_paths = false;
-                            Console.WriteLine("Enter path to video files: (leave blank to skip)");
-                            normal_audio_folder = Console.ReadLine();
-                            if (normal_audio_folder == "") break;
-
-                            if (normal_audio_folder.Substring(0, 1) == "+")
-                            {
-                                normal_audio_folder = normal_audio_folder.Substring(1);
-                                add_paths = true;
-                            }
-
-                            if (!Directory.Exists(normal_audio_folder))
-                            {
-                                drawMessage("Path does not exist");
-                            }
-                            else
-                            {
-                                paths.Add(normal_audio_folder);
-                                Console.WriteLine();
-                                Console.WriteLine(normal_audio_folder + " added to queue (" + paths.Count.ToString() + ")");
-                                Console.WriteLine();
-                                Console.WriteLine();
-                            }
-                        }
-
-                        TimeSpan tempTotal = TimeSpan.FromSeconds(0);
-
-                        for (int i = 0; i < paths.Count; i++)
-                        {
-
-                            normal_audio_folder = paths[i];
-
-                            if (normal_audio_folder != "")
-                            {
-                                List<string> normal_audio = GetFiles(normal_audio_folder, video_file_extensions, new string[] { "_NA_" });
-
-                                if (normal_audio.Count > 0)
-                                {
-                                    int nac = 0;
-                                    int nacm = normal_audio.Count;
-
-                                    TimeSpan filter = TimeSpan.FromSeconds(0);
-                                    TimeSpan apply = TimeSpan.FromSeconds(0);
-                                    TimeSpan tl = TimeSpan.FromSeconds(0);
-
-                                    while (normal_audio.Count > 0)
-                                    {
-
-                                        drawScreen(1);
-
-                                        tempTotal = filter.Add(apply);
-
-                                        Console.WriteLine("Estimated time remaining: " + tl.Hours.ToString().PadLeft(2, '0') + "h" + tl.Minutes.ToString().PadLeft(2, '0') + "m" + tl.Seconds.ToString().PadLeft(2, '0') + "s Elapsed: " + tempTotal.Hours.ToString().PadLeft(2, '0') + "h" + tempTotal.Minutes.ToString().PadLeft(2, '0') + "m" + tempTotal.Seconds.ToString().PadLeft(2, '0') + "s");
-                                        Console.WriteLine("");
-
-                                        Console.WriteLine("Normalizing audio for: " + Path.GetFileName(normal_audio[0]));
-                                        Console.WriteLine("File " + (nac + 1).ToString() + " of " + nacm.ToString());
-                                        Console.WriteLine();
-                                        TimeSpan[] vals = NormalizeAudio(normal_audio[0]);
-
-                                        filter = filter.Add(vals[0]);
-                                        apply = apply.Add(vals[1]);
-
-                                        double timeleft = ((filter.TotalSeconds + apply.TotalSeconds) / (nac + 1)) * (nacm - (nac + 1));
-
-                                        tl = TimeSpan.FromSeconds(timeleft);
-
-
-
-                                        if (filter.TotalSeconds == 0)
-                                        {
-                                            nacm--;
-                                        }
-                                        else
-                                        {
-                                            nac++;
-                                        }
-                                        normal_audio.RemoveAt(0);
-                                    }
-                                }
-                            }
-
-                        }
-
-                        drawMessage("Normalization complete!" + Environment.NewLine + "Total time: " + tempTotal.Hours.ToString().PadLeft(2, '0') + "h" + tempTotal.Minutes.ToString().PadLeft(2, '0') + "m" + tempTotal.Seconds.ToString().PadLeft(2, '0') + "s");
-
-                        break;
-                    case '2': //print breaks
-                        List<string> print_breaks = new List<string>(); // GetFiles(@"G:\Projects\Video\torrents\Murder She Wrote - Season 4");// folder + "\\print_breaks\\");
-
-                        drawScreen(2);//print breaks
-
-                        Console.WriteLine("Enter path to video files: (leave blank to skip)");
-                        string print_folder = Console.ReadLine();
-                        if (print_folder == "") break;
-
-                        if (!Directory.Exists(print_folder))
-                        {
-                            drawMessage("Path does not exist");
-                            break;
-                        }
-
-                        string print_breaks_folder = print_folder; // @"H:\tv station\specials\football";
-                        print_breaks = GetFiles(print_breaks_folder, video_file_extensions);
-
-                        if (print_breaks.Count > 0)
-                        {
-
-
-                            Console.WriteLine("");
-                            Console.WriteLine("");
-                            Console.WriteLine("Enter threshold: (length of BLACK frames to be considered, default 0.5 seconds)");
-                            string athresh = Console.ReadLine();
-                            double iathresh = 0.5;
-                            try
-                            {
-                                if (athresh != "") iathresh = Double.Parse(athresh);
-                            }
-                            catch { }
-                            Console.WriteLine("Threshold set to " + iathresh.ToString() + " sec(s)");
-
-                            Console.WriteLine("");
-                            Console.WriteLine("");
-                            Console.WriteLine("Enter black luminance: (pure black=0, black=0.05, light black=0.1, etc, default 0.05)");
-                            string ablack = Console.ReadLine();
-                            double iblack = 0.10;
-                            try
-                            {
-                                if (ablack != "") iblack = Double.Parse(ablack);
-                            }
-                            catch { }
-
-                            Console.WriteLine("Black value set to " + iblack.ToString() + " sec(s)");
-
-                            Console.WriteLine("");
-                            Console.WriteLine("");
-                            Console.WriteLine("Enter minimum amount of commercials (default is 3):");
-                            string amincomm = Console.ReadLine();
-                            double imincomm = 3;
-                            try
-                            {
-                                if (amincomm != "") imincomm = Double.Parse(amincomm);
-                            }
-                            catch { }
-
-                            Console.WriteLine("Minimum commercials set to " + imincomm.ToString() + "");
-
-                            Console.WriteLine("");
-                            Console.WriteLine("");
-                            Console.WriteLine("Enter minimum start time: (time from beginning of video, default 0 seconds)");
-                            string dwait = Console.ReadLine();
-                            double iwait = 0;
-                            try
-                            {
-                                if (dwait != "") iwait = Double.Parse(dwait);
-                            }
-                            catch { }
-
-                            Console.WriteLine("Minimum start time set to " + iwait.ToString() + " sec(s)");
-
-                            Console.WriteLine("");
-                            Console.WriteLine("");
-                            Console.WriteLine("Enter minimum length between breaks: (how long after the last break for a new break, default 300 seconds)");
-                            string dblength = Console.ReadLine();
-                            int iblength = 300;
-                            try
-                            {
-                                if (dblength != "") iblength = Int32.Parse(dblength);
-                            }
-                            catch { }
-
-
-                            Console.WriteLine("Minimum length is " + iblength.ToString() + " sec(s)");
-
-                            Console.WriteLine("");
-                            Console.WriteLine("");
-                            Console.WriteLine("Enter time from end of video to stop looking for breaks: (default 0 seconds)");
-                            string dend = Console.ReadLine();
-                            int iend = 0;
-                            try
-                            {
-                                if (dend != "") iend = Int32.Parse(dend);
-                            }
-                            catch { }
-
-
-                            Console.WriteLine("End of video minus " + iend.ToString() + " sec(s)");
-
-
-                            Console.WriteLine("");
-                            Console.WriteLine("");
-                            Console.WriteLine("Shall we make up some breaks if none are found? ([Y]es or [N]o)");
-
-
-                            bool print_anyway = false;
-                            string breaksmakeup = Console.ReadLine().Trim().ToLower();
-                            if (breaksmakeup.Substring(0,1) == "y")
-                            {
-                                print_anyway = true;
-                            }
-                            else
-                            {
-                                print_anyway = false;
-                            }
-                            
-
-
-                            while (print_breaks.Count > 0)
-                            {
-                                Console.WriteLine();
-                                Console.WriteLine("Printing breaks for:" + print_breaks[0]);
-
-                                string spb_output = print_breaks_folder + "\\" + Path.GetFileName(print_breaks[0]) + ".commercials";
-
-                                if (!File.Exists(spb_output))
-                                {
-                                    //List<TimeSpan> cms = scanForCommercialBreaks(print_breaks[0], 0.5, iwait);
-                                    List<TimeSpan> cms = NEWscanForCommercialBreaks(print_breaks[0], iathresh, iwait, iblength, iend, iblack, false);
-                                    if (cms.Count >= imincomm)
-                                    {
-                                        Console.Write(cms.Count.ToString());
-                                        //Console.ReadKey();
-                                        string spb = "";
-                                        foreach (TimeSpan t in cms)
-                                        {
-                                            AddLog("Found commercial at (in seconds): " + Math.Floor(t.TotalSeconds).ToString());
-                                            //AddLog("Found commercial at (in seconds): " + (t.TotalSeconds).ToString());
-                                            //spb += Math.Floor(t.TotalSeconds).ToString() + "\n";
-                                            spb += t.TotalSeconds.ToString() + "\n";
-
-                                            //spb += (t.TotalSeconds).ToString() + "\n";
-
-                                        }
-                                        if (spb != "")
-                                        {
-                                            File.WriteAllText(spb_output, spb.Substring(0, spb.Length - 1));
-                                            AddLog("Prnted breaks: " + spb_output);
-                                        }
-                                    }
-                                    else
-                                    {
-                                        Console.WriteLine("Only found " + (cms.Count).ToString() + " which is less than minimum required of " + amincomm + ". Skipping");
-                                    }
-                                    if (print_anyway)
-                                    {
-                                        Console.WriteLine("");
-                                        Console.WriteLine("No breaks found, making some up!");
-                                        Console.WriteLine("Getting length of video to use as a reference");
-                                        string[] atime = getDurationAndAudioFilter(print_breaks[0]);
-                                        Debug.WriteLine(atime[0]);
-                                        if (atime[0] != "")
-                                        {
-                                            double ilength = (double)TimeSpan.Parse(atime[0]).TotalSeconds;
-                                            if (ilength >= 0)
-                                            {
-                                                Console.WriteLine("Found length: " + atime[0].ToString());
-                                                int ibreaks = (int)Math.Floor(ilength / 600);
-                                                string sbreaks = "";
-                                                for (int i = 1; i <= ibreaks; i++)
-                                                {
-                                                    if ((600 * i) < ilength) sbreaks += (600 * i).ToString() + "\n";
-                                                }
-                                                Console.WriteLine(sbreaks);
-                                                if (sbreaks != "")
-                                                {
-                                                    File.WriteAllText(spb_output, sbreaks.Substring(0, sbreaks.Length - 1));
-                                                }
-                                            }
-                                        }
-
-                                    }
-                                }
-                                else
-                                {
-                                    AddLog("Commercials Already exist for this show.");
-                                    //Console.Write("Commercials Already exist for this show.");
-                                }
-                                print_breaks.RemoveAt(0);
-                            }
-
-                            //return;
-                        }
-                        drawMessage("Print Breaks complete!");
-                        break;
-                    case '3': //split video
-                        drawScreen(3); //split
-                        Console.WriteLine("Enter path to video files:");
-                        string split_in_folder = Console.ReadLine();
-
-                        if (split_in_folder == "") break;
-
-                        if (!Directory.Exists(split_in_folder))
-                        {
-                            drawMessage("Path does not exist");
-                            break;
-                        }
-
-                        Console.WriteLine("");
-                        Console.WriteLine("");
-
-                        Console.WriteLine("Enter output path : (leave blank to create new folder \\output\\)");
-                        string split_out_folder = Console.ReadLine();
-
-                        if (split_out_folder == "")
-                        {
-                            split_out_folder = split_in_folder + "\\output\\";
-                            if (!Directory.Exists(split_out_folder))
-                            {
-                                Directory.CreateDirectory(split_out_folder);
-                            }
-                            else
-                            {
-                                drawMessage("Output folder already exists" + Environment.NewLine + "Any files currently in there may be overwritten");
-                            }
-                        }
-                        if (!Directory.Exists(split_out_folder))
-                        {
-                            drawMessage("Path does not exist");
-                            break;
-                        }
-
-                        Console.WriteLine("");
-                        Console.WriteLine("");
-                        Console.WriteLine("Enter threshold: (length of time to be considered, default 0.5 seconds)");
-                        string thresh = Console.ReadLine();
-                        double ithresh = 0.5;
-                        try
-                        {
-                            if (thresh != "") ithresh = Double.Parse(thresh);
-                        }
-                        catch { }
-
-                        Console.WriteLine("Threshold set to " + ithresh.ToString() + " sec(s)");
-
-                        Console.WriteLine("");
-                        Console.WriteLine("");
-                        Console.WriteLine("Enter black level: (0=pure black, 0.1=black, 0.2=light black, etc, default 0.05)");
-                        string lblack= Console.ReadLine();
-                        double ilblack = 0.05;
-                        try
-                        {
-                            if (lblack != "") ilblack = Double.Parse(lblack);
-                        }
-                        catch { }
-
-                        Console.WriteLine("Threshold set to " + ilblack.ToString() + " sec(s)");
-
-                        Console.WriteLine("");
-                        Console.WriteLine("");
-
-                        checkSplits(split_in_folder, split_out_folder, ithresh, ilblack);
-
-                        drawMessage("Splits have been checked!");
-                        AddLog("Splits have been checked.");
-                        //Console.ReadKey();
-                        break;
-                    case '4':
-                        //print generic breaks
-                        drawScreen(4);
-                        //getDurationAndAudioFilter
-                        Console.ReadKey();
-                        break;
+                        ProcessAudioNormalizationMenu();
+                    break;
+                    case '2':
+                        ProcessPrintBreaksMenu();
+                    break;
+                    case '3':
+                        ProcessSplitVideoMenu();
+                    break;
                     case '5':
-                        //auto scan vidow for black bars
-
-                        drawScreen(5); //bars
-
-                        Console.WriteLine("Enter path to video files:");
-                        string bbars_folder = Console.ReadLine();
-
-                        if (bbars_folder == "") break;
-                        if (!Directory.Exists(bbars_folder))
-                        {
-                            drawMessage("Path does not exist");
-                            break;
-                        }
-
-                        Console.WriteLine();
-                        Console.WriteLine();
-
-                        MoveTaggedFiles(bbars_folder);
-
-                        break;
-                    case '6': //print breaks test
-                        List<string> print_breaks_test = new List<string>(); // GetFiles(@"G:\Projects\Video\torrents\Murder She Wrote - Season 4");// folder + "\\print_breaks\\");
-
-                        drawScreen(6);//print breaks
-
-                        Console.WriteLine("Enter path to video file: (leave blank to skip)");
-                        string print_file = Console.ReadLine();
-                        if (print_file == "") break;
-
-                        if (!File.Exists(print_file))
-                        {
-                            drawMessage("Path does not exist");
-                            break;
-                        }
-
-                        Console.WriteLine("");
-                        Console.WriteLine("");
-                        Console.WriteLine("Enter threshold: (length of BLACK frames to be considered, default 0.5 seconds)");
-                        string atthresh = Console.ReadLine();
-                        double itathresh = 0.5;
-                        try
-                        {
-                            if (atthresh != "") itathresh = Double.Parse(atthresh);
-                        }
-                        catch { }
-
-                        Console.WriteLine("");
-                        Console.WriteLine("");
-                        Console.WriteLine("Enter black luminance: (pure black=0, black=0.05, light black=0.1, etc, default 0.05)");
-                        string atblack = Console.ReadLine();
-                        double itblack = 0.10;
-                        try
-                        {
-                            if (atblack != "") itblack = Double.Parse(atblack);
-                        }
-                        catch { }
-
-                        Console.WriteLine("Threshold set to " + itblack.ToString() + " sec(s)");
-
-                        Console.WriteLine("");
-                        Console.WriteLine("");
-                        Console.WriteLine("Enter minimum start time: (time from beginning of video, default 0 seconds)");
-                        string dtwait = Console.ReadLine();
-                        double itwait = 0;
-                        try
-                        {
-                            if (dtwait != "") itwait = Double.Parse(dtwait);
-                        }
-                        catch { }
-
-                        Console.WriteLine("Minimum start time set to " + itwait.ToString() + " sec(s)");
-
-                        Console.WriteLine("");
-                        Console.WriteLine("");
-                        Console.WriteLine("Enter minimum length between breaks: (how long after the last break for a new break, default 300 seconds)");
-                        string dtlength = Console.ReadLine();
-                        int itlength = 300;
-                        try
-                        {
-                            if (dtlength != "") itlength = Int32.Parse(dtlength);
-                        }
-                        catch { }
-
-
-                        Console.WriteLine("Minimum length is " + itlength.ToString() + " sec(s)");
-
-                        Console.WriteLine("");
-                        Console.WriteLine("");
-                        Console.WriteLine("Enter time from end of video to stop looking for breaks: (default 0 seconds)");
-                        string dtend = Console.ReadLine();
-                        int itend = 0;
-                        try
-                        {
-                            if (dtend != "") itend = Int32.Parse(dtend);
-                        }
-                        catch { }
-
-
-                        Console.WriteLine("End of video minus " + itend.ToString() + " sec(s)");
-
-                        Console.WriteLine("");
-                        Console.WriteLine("Scanning for commercials...");
-                        Console.WriteLine("");
-                        List<TimeSpan> tcms = NEWscanForCommercialBreaks(print_file, itathresh, itwait, itlength, itend, itblack);
-                        Console.WriteLine("Found " + tcms.Count.ToString() + " commercial(s)");
-                        Console.WriteLine("");
-                        foreach (TimeSpan t in tcms)
-                        {
-                            Console.WriteLine("Found commercial at (in seconds): " + t.ToString());
-
-                        }
-                        Console.WriteLine("");
-                        Console.WriteLine("Settings used:");
-                        Console.WriteLine("Threshhold: " + itathresh.ToString());
-                        Console.WriteLine("Black Luminance: " + itblack.ToString());
-                        Console.WriteLine("Minimum Start time: " + itwait.ToString());
-                        Console.WriteLine("Minimum length between breaks: " + itlength.ToString());
-                        Console.WriteLine("Time from end of video to stop checking: " + itend.ToString());
-                        Console.WriteLine("");
-                        Console.WriteLine("Press any key to return to options");
-                        Console.ReadKey();
-                break;
+                        ProcessMoveTaggedFilesMenu();
+                    break;
+                    case '6':
+                        ProcessTestSingleBreakScanMenu();
+                    break;
                     case '7':
-                        //add video length to filename
-
-                        drawScreen(7); //timeadder
-
-                        Console.WriteLine("Enter path to video files:");
-                        string vidlen_folder = Console.ReadLine();
-
-                        if (vidlen_folder == "") break;
-                        if (!Directory.Exists(vidlen_folder))
-                        {
-                            drawMessage("Path does not exist");
-                            break;
-                        }
-
-                        recurse_add_duration(vidlen_folder);
-
-                        Console.ReadKey();
-                        break;
-
+                        ProcessAddDurationToFilenamesMenu();
+                    break;
                     case '9':
-                        //options
-                        drawScreen(9); //options
-
-                        Console.WriteLine("");
-                        Console.WriteLine("");
-                        Console.WriteLine("Enter FFMPEG Location: ");
-                        if (ffmpeg_location != "") SendKeys.SendWait(ffmpeg_location);
-                        string flocation = Console.ReadLine();
-
-                        if (File.Exists(flocation) == false)
-                        {
-                            drawMessage("Could not verify file existance!");
-                            break;
-                        }
-
-                        Console.WriteLine("");
-                        Console.WriteLine("");
-                        Console.WriteLine("Enter Alt FFMPEG Location: ");
-                        if (ffmpeg_location != "") SendKeys.SendWait(ffmpegX_location);
-                        string xlocation = Console.ReadLine();
-
-                        if (File.Exists(xlocation) == false)
-                        {
-                            drawMessage("Could not verify file existance!");
-                            break;
-                        }
-
-                        Console.WriteLine("");
-                        Console.WriteLine("");
-                        Console.WriteLine("Enter TEMP Path: (if it doesn't exist, it'll be created)");
-                        if (temp_folder != "") SendKeys.SendWait(temp_folder);
-                        string tlocation = Console.ReadLine();
-
-                        if (Directory.Exists(tlocation) == false)
-                        {
-                            Directory.CreateDirectory(tlocation);
-                        }
-
-                        Console.WriteLine("");
-                        Console.WriteLine("");
-                        Console.WriteLine("Enter Log File Location: (if it doesn't exist, it'll be created)");
-                        if (temp_folder != "") SendKeys.SendWait(temp_folder);
-                        string llocation = Console.ReadLine();
-
-                        if (Directory.Exists(llocation) == false)
-                        {
-                            Directory.CreateDirectory(llocation);
-                        }
-
-                        ffmpeg_location = flocation;
-                        ffmpegX_location = xlocation;
-                        temp_folder = tlocation;
-                        Log_File = llocation;
-
-                        File.WriteAllText("settings.txt", "ffmpeg location=" + ffmpeg_location + Environment.NewLine + "alt ffmpeg location=" + ffmpegX_location + Environment.NewLine + "temp folder=" + temp_folder + Environment.NewLine + "log file=" + temp_folder + Environment.NewLine);
-
-                        break;
+                        ProcessSettingsMenu();
+                    break;
                     case 'n':
-                        //add video length to filename
-
-                        drawScreen('n'); //timeadder
-
-                        Console.WriteLine("Enter path to files:");
-                        string rna_folder = Console.ReadLine();
-
-                        if (rna_folder == "") break;
-                        if (Directory.Exists(rna_folder) == false)
-                        {
-                            drawMessage("Path does not exist: " + rna_folder);
-                            break;
-                        }
-
-                        List<string> rna_files = GetFiles(rna_folder);
-
-                        while (rna_files.Count > 0)
-                        {
-
-                            string file = rna_files[0];
-                            if (File.Exists(file))
-                            {
-                                string path = Path.GetDirectoryName(file);
-                                string file_name = Path.GetFileNameWithoutExtension(file);
-                                file_name = file_name.Replace("_NA_", "");
-                                string ext_name = Path.GetExtension(file);
-
-                                Console.WriteLine();
-
-                                File.SetAttributes(file, FileAttributes.Normal);
-                                try
-                                {
-                                    File.Move(file, path + "\\" + file_name + ext_name);
-                                }
-                                catch (Exception e)
-                                {
-                                    Console.WriteLine(e.ToString());
-                                }
-                                Console.WriteLine(file + " ==> " + path + "\\" + file_name + ext_name);
-                                Console.WriteLine("Removed _NA_!");
-                            }
-
-                            rna_files.RemoveAt(0);
-                        }
-                        Console.WriteLine("Normalization MARK (_NA_) has been removed. Press and key to continue...");
-
-                        Console.ReadKey();
-                        break;
+                        ProcessRemoveNormalizationMarkMenu();
+                    break;
                     case 'k':
-                        //add video length to filename
-
-                        drawScreen('k'); //timeadder
-
-                        Console.WriteLine("Enter path to files:");
-                        string kla_folder = Console.ReadLine();
-
-                        if (kla_folder == "") break;
-                        if (Directory.Exists(kla_folder) == false)
-                        {
-                            drawMessage("Path does not exist: " + kla_folder);
-                            break;
-                        }
-
-                        List<string> kla_files = GetFiles(kla_folder);
-
-                        Console.WriteLine("Enter string to append to file:");
-                        string kda_string = Console.ReadLine();
-                        if (kda_string != "")
-                        {
-
-                            while (kla_files.Count > 0)
-                            {
-
-                                string file = kla_files[0];
-                                if (File.Exists(file) && file.IndexOf(kda_string) < 0)
-                                {
-                                    string path = Path.GetDirectoryName(file);
-                                    string file_name = Path.GetFileNameWithoutExtension(file);
-                                    string ext_name = Path.GetExtension(file);
-
-                                    Console.WriteLine();
-
-                                    File.SetAttributes(file, FileAttributes.Normal);
-                                    try
-                                    {
-                                        File.Move(file, path + "\\" + file_name + kda_string + ext_name);
-                                    }
-                                    catch (Exception e)
-                                    {
-                                        Console.WriteLine(e.ToString());
-                                    }
-                                    Console.WriteLine(file + " ==> " + path + "\\" + file_name + kda_string + ext_name);
-                                    Console.WriteLine("Done!");
-                                }
-
-                                kla_files.RemoveAt(0);
-                            }
-                            Console.WriteLine(kda_string + " has been added. Press and key to continue...");
-
-                            Console.ReadKey();
-                        }
-
-                        Console.WriteLine("Enter string to prepend to file:");
-                        kda_string = Console.ReadLine();
-                        if (kda_string != "")
-                        {
-
-                            while (kla_files.Count > 0)
-                            {
-
-                                string file = kla_files[0];
-                                if (File.Exists(file) && file.IndexOf(kda_string) < 0)
-                                {
-                                    string path = Path.GetDirectoryName(file);
-                                    string file_name = Path.GetFileNameWithoutExtension(file);
-                                    string ext_name = Path.GetExtension(file);
-
-                                    Console.WriteLine();
-
-                                    File.SetAttributes(file, FileAttributes.Normal);
-                                    try
-                                    {
-                                        File.Move(file, path + "\\" + kda_string + file_name  + ext_name);
-                                    }
-                                    catch (Exception e)
-                                    {
-                                        Console.WriteLine(e.ToString());
-                                    }
-                                    Console.WriteLine(file + " ==> " + path + "\\" + kda_string + file_name + ext_name);
-                                    Console.WriteLine("Done!");
-                                }
-
-                                kla_files.RemoveAt(0);
-                            }
-                            Console.WriteLine(kda_string + " has been added. Press and key to continue...");
-
-                            Console.ReadKey();
-                        }
-
-                        break;
+                        ProcessAppendPrependFilenamesMenu();
+                    break;
                     case 'l':
-                        //add video length to filename
-
-                        drawScreen('l'); //timeadder
-
-                        Console.WriteLine("Enter path to files:");
-                        string rla_folder = Console.ReadLine();
-
-                        if (rla_folder == "") break;
-                        if (Directory.Exists(rla_folder) == false)
-                        {
-                            drawMessage("Path does not exist: " + rla_folder);
-                            break;
-                        }
-
-                        List<string> rla_files = GetFiles(rla_folder);
-
-                        Console.WriteLine("Enter string to find:");
-                        string da_string = Console.ReadLine();
-                        if (da_string == "") break;
-
-                        Console.WriteLine("Enter string to replace:");
-                        string rep_string = Console.ReadLine();
-                        
-
-                        while (rla_files.Count > 0)
-                        {
-
-                            string file = rla_files[0];
-                            if (File.Exists(file))
-                            {
-                                string path = Path.GetDirectoryName(file);
-                                string file_name = Path.GetFileNameWithoutExtension(file);
-                                file_name = file_name.Replace("_NA_", "|||||");
-                                if (file_name.IndexOf(da_string) > -1)
-                                {
-                                    file_name = file_name.Replace(da_string, rep_string);
-
-                                    file_name = file_name.Replace("|||||", "_NA_");
-                                    string ext_name = Path.GetExtension(file);
-
-                                    Console.WriteLine();
-
-                                    File.SetAttributes(file, FileAttributes.Normal);
-                                    try
-                                    {
-                                        File.Move(file, path + "\\" + file_name + ext_name);
-                                    }
-                                    catch (Exception e)
-                                    {
-                                        Console.WriteLine(e.ToString());
-                                    }
-                                    Console.WriteLine(file + " ==> " + path + "\\" + file_name + ext_name);
-                                    Console.WriteLine("Done!");
-                                }
-                            }
-
-                            rla_files.RemoveAt(0);
-                        }
-                        Console.WriteLine(da_string + " has been replaced with " + rep_string + ". Press and key to continue...");
-
-                        Console.ReadKey();
-                        break;
+                        ProcessFindReplaceFilenamesMenu();
+                    break;
                     case 'm':
-                        //add normalized audio mark to file name (_NA_)
-
-                        drawScreen('m'); //
-
-                        Console.WriteLine("Enter path to files:");
-                        string mrna_folder = Console.ReadLine();
-
-                        if (mrna_folder == "") break;
-                        if (Directory.Exists(mrna_folder) == false)
-                        {
-                            drawMessage("Path does not exist: " + mrna_folder);
-                            break;
-                        }
-
-                        List<string> mrna_files = GetFiles(mrna_folder);
-
-                        while (mrna_files.Count > 0)
-                        {
-
-                            string file = mrna_files[0];
-                            if (File.Exists(file))
-                            {
-                                string path = Path.GetDirectoryName(file);
-                                string file_name = Path.GetFileNameWithoutExtension(file);
-                                string ext_name = Path.GetExtension(file);
-                                string nfile = "";
-                                if (file_name.IndexOf("_NA_") == -1)
-                                {
-
-                                    Console.WriteLine();
-
-                                    File.SetAttributes(file, FileAttributes.Normal);
-
-                                    try
-                                    {
-
-                                        if (ext_name.ToLower() == ".commercials")
-                                        {
-                                            ext_name = Path.GetExtension(path + "\\" + file_name);
-                                            file_name = Path.GetFileNameWithoutExtension(path + "\\" + file_name);
-                                            nfile = path + "\\" + file_name + "_NA_" + ext_name + ".commercials";
-                                            File.Move(file, nfile);
-                                        }
-                                        else
-                                        {
-                                            nfile = path + "\\" + file_name + "_NA_" + ext_name;
-                                            File.Move(file, nfile);
-                                        }
-                                    }
-                                    catch (Exception e)
-                                    {
-                                        Console.WriteLine(e.ToString());
-                                    }
-                                    Console.WriteLine(file + " ==> " + nfile);
-                                    Console.WriteLine("Added _NA_!");
-                                }
-                            }
-
-                            mrna_files.RemoveAt(0);
-                        }
-                        Console.WriteLine("Normalization MARK (_NA_) has been ADDED. Press and key to continue...");
-
-                        Console.ReadKey();
-                        break;
+                        ProcessAddNormalizationMarkMenu();
+                    break;
                     case 'u':
-                        //add video length to filename
-
-                        drawScreen('u'); //timeadder
-
-                        Console.WriteLine("Enter path to files:");
-                        string urna_folder = Console.ReadLine();
-
-                        if (urna_folder == "") break;
-                        if (Directory.Exists(urna_folder) == false)
-                        {
-                            drawMessage("Path does not exist: " + urna_folder);
-                            break;
-                        }
-
-                        List<string> urna_files = GetFiles(urna_folder);
-
-                        while (urna_files.Count > 0)
-                        {
-
-                            string file = urna_files[0];
-                            if (File.Exists(file))
-                            {
-                                string path = Path.GetDirectoryName(file);
-                                string file_name = Path.GetFileNameWithoutExtension(file);
-                                file_name = ReturnCleanASCII(file_name);
-                                string ext_name = Path.GetExtension(file);
-
-                                Console.WriteLine();
-
-                                File.SetAttributes(file, FileAttributes.Normal);
-                                try
-                                {
-                                    File.Move(file, path + "\\" + file_name + ext_name);
-                                }
-                                catch (Exception e)
-                                {
-                                    Console.WriteLine(e.ToString());
-                                }
-                                Console.WriteLine(file + " ==> " + path + "\\" + file_name + ext_name);
-                                Console.WriteLine("Clean Ascii Filenames complete!");
-                            }
-
-                            urna_files.RemoveAt(0);
-                        }
-                        Console.WriteLine("Clean Ascii Filenames complete! Press and key to continue...");
-
-                        Console.ReadKey();
-                        break;
+                        ProcessCleanAsciiFilenamesMenu();
+                    break;
                     case 't':
-                        //add video length to filename
-
-                        drawScreen('t'); //timeadder
-
-                        Console.WriteLine("Enter path to files:");
-                        string tna_folder = Console.ReadLine();
-
-                        if (tna_folder == "") break;
-                        if (Directory.Exists(tna_folder) == false)
-                        {
-                            drawMessage("Path does not exist: " + tna_folder);
-                            break;
-                        }
-
-                        List<string> tna_files = GetFiles(tna_folder);
-
-                        while (tna_files.Count > 0)
-                        {
-
-                            string file = tna_files[0];
-                            if (File.Exists(file))
-                            {
-                                string path = Path.GetDirectoryName(file);
-                                string file_name = Path.GetFileNameWithoutExtension(file);
-                                string ext_name = Path.GetExtension(file);
-                                int itna = file_name.IndexOf("%T(");
-                                int itnb = file_name.IndexOf(")%", itna+1);
-                                if (itna > -1 && itnb > -1)
-                                {
-
-                                    file_name = file_name.Substring(0, itna) + file_name.Substring(itnb+2);
-
-                                    Console.WriteLine();
-
-                                    File.SetAttributes(file, FileAttributes.Normal);
-                                    try
-                                    {
-                                        File.Move(file, path + "\\" + file_name + ext_name);
-                                    }
-                                    catch (Exception e)
-                                    {
-                                        Console.WriteLine(e.ToString());
-                                    }
-                                    Console.WriteLine(file + " ==> " + path + "\\" + file_name + ext_name);
-                                    Console.WriteLine("Removed %(timestamp)%!");
-                                }
-                            }
-
-                            tna_files.RemoveAt(0);
-                        }
-                        Console.WriteLine("Timestamp %(timestamp)% has been removed. Press and key to continue...");
-
-                        Console.ReadKey();
-                        break;
+                        ProcessRemoveTimestampTokensMenu();
+                    break;
                     default:
                         Console.CursorVisible = false;
                         drawMessage("Invalid Entry!");
