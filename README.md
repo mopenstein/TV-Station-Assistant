@@ -6,7 +6,7 @@
 
 # Tv Station Assistant
 
-**Tv Station Assistant** is a C# console application designed to automate audio normalization, commercial break detection, compilation splitting, and file tagging for video archives. Built around FFmpeg, it prepares media at 640x480 for SD tv viewing for the Raspberry Pi TV Station emulator: https://github.com/mopenstein/raspberry_pi_tv_station
+**Tv Station Assistant** is a C# console application designed to automate audio normalization, commercial break detection, compilation splitting, and file tagging for video archives. Built around FFmpeg, it prepares media at 640x480 for SD tv viewing for the Raspberry Pi TV Station emulator: https://github.com/mopenstein/Raspberry-Pi-TV-Station
 
 <img src="/assets/Screenshot%202026-09-29%20154z530.png" width="80%" title="CLI Screenshot">
 ---
